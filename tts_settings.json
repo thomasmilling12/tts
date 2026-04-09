@@ -1,0 +1,11 @@
+{
+    "tts_enabled": true,
+    "no_mic_channel_id": null,
+    "same_vc_required": true,
+    "smart_filter": true,
+    "ignored_users": [],
+    "say_name": true,
+    "language": "en",
+    "max_length": 300,
+    "idle_timeout": 300
+}
