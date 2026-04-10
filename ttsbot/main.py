@@ -26,6 +26,12 @@ SHORT_MESSAGES = {"lol", "lmao", "ok", "k", "w", "?", "??", "\U0001F602", "\U000
 AUTO_JOIN_DELAY_SECONDS = 1.0
 AUTO_LEAVE_DELAY_SECONDS = 5.0
 TRANSLATE_MIN_LENGTH = 6
+AI_REPLY_PREFIXES = ("bot ", "bot,", "assistant ", "assistant,", "ttsbot ", "ttsbot,")
+LANGUAGE_ALIASES = {
+    "zh-cn": "zh-CN",
+    "zh-tw": "zh-TW",
+    "he": "iw",
+}
 
 DetectorFactory.seed = 0
 
@@ -132,26 +138,46 @@ def default_settings() -> dict:
         "no_mic_channel_id": None,
         "voice_channel_id": None,
         "read_muted_only": False,
+        "read_not_deafened_only": False,
         "same_vc_required": True,
         "smart_filter": True,
         "ignored_users": [],
         "language": "en",
         "max_length": 300,
-        "translate_enabled": False,
+        "translation_mode": "off",
+        "volume": 100,
         "voice_style": "female",
+        "ai_reply_enabled": False,
     }
 
 
 def sanitize_settings(settings: dict) -> dict:
     clean = default_settings()
-    clean.update(settings)
+    for key in clean:
+        if key in settings:
+            clean[key] = settings[key]
+
+    if "translate_enabled" in settings and "translation_mode" not in settings:
+        clean["translation_mode"] = "english" if settings.get("translate_enabled") else "off"
 
     if clean["language"] not in SUPPORTED_LANGUAGES:
         clean["language"] = "en"
+    if clean["translation_mode"] not in {"off", "english", "original"}:
+        clean["translation_mode"] = "off"
     if clean["voice_style"] not in VOICE_PROFILES:
         clean["voice_style"] = "female"
     if not isinstance(clean["ignored_users"], list):
         clean["ignored_users"] = []
+    if not isinstance(clean["read_muted_only"], bool):
+        clean["read_muted_only"] = False
+    if not isinstance(clean["read_not_deafened_only"], bool):
+        clean["read_not_deafened_only"] = False
+    if not isinstance(clean["ai_reply_enabled"], bool):
+        clean["ai_reply_enabled"] = False
+    try:
+        clean["volume"] = max(0, min(100, int(clean["volume"])))
+    except (TypeError, ValueError):
+        clean["volume"] = 100
 
     return clean
 
@@ -273,6 +299,95 @@ def member_matches_readmuted(member: discord.Member, settings: dict) -> bool:
     return bool(voice_state.self_mute or voice_state.mute)
 
 
+def member_matches_readnotdeafened(member: discord.Member, settings: dict) -> bool:
+    if not settings.get("read_not_deafened_only", False):
+        return True
+
+    linked_channel = get_linked_voice_channel(member.guild)
+    if not member_is_in_channel(member, linked_channel):
+        return False
+
+    voice_state = member.voice
+    if voice_state is None:
+        return False
+
+    return not bool(voice_state.self_deaf or voice_state.deaf)
+
+
+def detect_supported_language(text: str, fallback: str) -> str:
+    try:
+        detected = detect(text)
+    except LangDetectException:
+        return fallback
+
+    normalized = LANGUAGE_ALIASES.get(detected.lower(), detected)
+    if normalized in SUPPORTED_LANGUAGES:
+        return normalized
+    return fallback
+
+
+def extract_ai_prompt(message: discord.Message) -> str | None:
+    content = message.content or ""
+
+    if bot.user is not None:
+        content = content.replace(bot.user.mention, " ")
+        content = content.replace(f"<@!{bot.user.id}>", " ")
+
+    cleaned = clean_message(content)
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    for prefix in AI_REPLY_PREFIXES:
+        if lowered.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+            break
+
+    return cleaned or None
+
+
+def should_trigger_ai_reply(message: discord.Message, settings: dict) -> bool:
+    if not settings.get("ai_reply_enabled", False):
+        return False
+    if message.guild is None or bot.user is None:
+        return False
+    if settings["no_mic_channel_id"] is None or message.channel.id != settings["no_mic_channel_id"]:
+        return False
+    if bot.user in message.mentions:
+        return True
+
+    cleaned = clean_message(message.content or "")
+    if not cleaned:
+        return False
+
+    prompt = extract_ai_prompt(message)
+    return prompt is not None and cleaned.lower().startswith(AI_REPLY_PREFIXES)
+
+
+def generate_ai_reply(prompt: str) -> str:
+    lowered = prompt.lower()
+    words = set(re.findall(r"[a-z']+", lowered))
+
+    if {"hello", "hey", "hi"} & words:
+        return "Hello. I am here and ready to read the channel."
+    if {"thank", "thanks", "ty"} & words:
+        return "You are welcome."
+    if any(word in lowered for word in ("help", "what can you do", "commands")):
+        return "Use slash commands like panel, voice, translate, volume, and muted filters to control me."
+    if "voice" in lowered:
+        return "Use the voice command to switch between male, female, and neutral styles."
+    if "translate" in lowered:
+        return "Use the translate command to choose off, english, or original mode."
+    if "volume" in lowered or "loud" in lowered or "quiet" in lowered:
+        return "Use the volume command with a value from zero to one hundred."
+    if "muted" in lowered or "deaf" in lowered:
+        return "I can filter by muted users or by users who are not deafened."
+    if "join" in lowered or "leave" in lowered:
+        return "Use join to link the voice channel and leave to disconnect."
+
+    return "I can read messages, translate them, change voices, and manage voice filters."
+
+
 async def schedule_auto_join(guild: discord.Guild, channel: discord.VoiceChannel | discord.StageChannel) -> None:
     cancel_task(guild_leave_tasks, guild.id)
 
@@ -380,6 +495,8 @@ def should_skip_message(message: discord.Message, settings: dict) -> bool:
         return True
     if not member_matches_readmuted(message.author, settings):
         return True
+    if not member_matches_readnotdeafened(message.author, settings):
+        return True
 
     cleaned = clean_message(message.content)
     if cleaned is None and not message.attachments:
@@ -408,15 +525,11 @@ async def ensure_same_vc(message: discord.Message, settings: dict) -> tuple[bool
     return True, None
 
 
-def translate_sync(text: str) -> tuple[str, bool]:
+def translate_to_english_sync(text: str) -> tuple[str, bool]:
     if len(text) < TRANSLATE_MIN_LENGTH:
         return text, False
 
-    try:
-        detected_language = detect(text)
-    except LangDetectException:
-        return text, False
-
+    detected_language = detect_supported_language(text, "en")
     if detected_language == "en":
         return text, False
 
@@ -431,19 +544,19 @@ def translate_sync(text: str) -> tuple[str, bool]:
     return translated, True
 
 
-async def maybe_translate_text(text: str, settings: dict) -> tuple[str, bool]:
-    if not settings.get("translate_enabled", False):
-        return text, False
-    return await asyncio.to_thread(translate_sync, text)
-
-
 async def build_spoken_text(message: discord.Message, settings: dict) -> tuple[str | None, str]:
     content = clean_message(message.content)
-    translated = False
+    spoken_language = settings.get("language", "en")
+    translation_mode = settings.get("translation_mode", "off")
 
     if content:
-        content, translated = await maybe_translate_text(content, settings)
-        content = clean_message(content)
+        if translation_mode == "english":
+            content, translated = await asyncio.to_thread(translate_to_english_sync, content)
+            if translated:
+                spoken_language = "en"
+            content = clean_message(content)
+        elif translation_mode == "original":
+            spoken_language = detect_supported_language(content, spoken_language)
 
     parts: list[str] = []
     if content:
@@ -454,10 +567,9 @@ async def build_spoken_text(message: discord.Message, settings: dict) -> tuple[s
         parts.append(attachment_text)
 
     if not parts:
-        return None, settings.get("language", "en")
+        return None, spoken_language
 
     spoken_text = " ".join(parts).strip()
-    spoken_language = "en" if translated else settings.get("language", "en")
     return spoken_text, spoken_language
 
 
@@ -468,10 +580,19 @@ def generate_tts_file(text: str, language: str, output_path: str) -> None:
     tts.save(output_path)
 
 
-async def speak_message(message: discord.Message, settings: dict) -> None:
-    guild = message.guild
+async def play_tts_text(
+    guild: discord.Guild,
+    text: str,
+    settings: dict,
+    *,
+    spoken_language: str | None = None,
+) -> None:
     voice_client = guild.voice_client
     if not voice_client or not voice_client.is_connected():
+        return
+
+    cleaned_text = clean_message(text)
+    if not cleaned_text:
         return
 
     lock = get_guild_lock(guild.id)
@@ -480,16 +601,14 @@ async def speak_message(message: discord.Message, settings: dict) -> None:
         if not voice_client or not voice_client.is_connected():
             return
 
-        spoken_text, spoken_language = await build_spoken_text(message, settings)
-        if not spoken_text:
-            return
-
         max_length = settings.get("max_length", 300)
-        if len(spoken_text) > max_length:
-            spoken_text = spoken_text[:max_length].rstrip() + "..."
+        if len(cleaned_text) > max_length:
+            cleaned_text = cleaned_text[:max_length].rstrip() + "..."
 
         voice_style = settings.get("voice_style", "female")
         voice_profile = VOICE_PROFILES.get(voice_style, VOICE_PROFILES["female"])
+        language = spoken_language or settings.get("language", "en")
+        volume = settings.get("volume", 100) / 100
 
         try:
             loop = asyncio.get_running_loop()
@@ -497,7 +616,7 @@ async def speak_message(message: discord.Message, settings: dict) -> None:
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 mp3_path = Path(temp_dir) / "tts.mp3"
-                await asyncio.to_thread(generate_tts_file, spoken_text, spoken_language, str(mp3_path))
+                await asyncio.to_thread(generate_tts_file, cleaned_text, language, str(mp3_path))
 
                 while voice_client.is_playing() or voice_client.is_paused():
                     await asyncio.sleep(0.3)
@@ -509,7 +628,8 @@ async def speak_message(message: discord.Message, settings: dict) -> None:
                     str(mp3_path),
                     options=voice_profile["ffmpeg_options"],
                 )
-                voice_client.play(source)
+                wrapped_source = discord.PCMVolumeTransformer(source, volume=volume)
+                voice_client.play(wrapped_source)
                 guild_last_spoke[guild.id] = loop.time()
 
                 while voice_client.is_playing():
@@ -517,6 +637,19 @@ async def speak_message(message: discord.Message, settings: dict) -> None:
 
         except Exception as exc:
             print(f"TTS generation/playback error in guild {guild.id}: {exc}")
+
+
+async def speak_message(message: discord.Message, settings: dict) -> None:
+    spoken_text, spoken_language = await build_spoken_text(message, settings)
+    if not spoken_text:
+        return
+
+    await play_tts_text(
+        message.guild,
+        spoken_text,
+        settings,
+        spoken_language=spoken_language,
+    )
 
 
 # --- Safety cleanup task ---
@@ -561,6 +694,17 @@ async def on_message(message: discord.Message) -> None:
             ok, _ = await ensure_same_vc(message, settings)
             if ok:
                 await speak_message(message, settings)
+
+                if should_trigger_ai_reply(message, settings):
+                    prompt = extract_ai_prompt(message)
+                    if prompt:
+                        ai_reply = generate_ai_reply(prompt)
+                        await play_tts_text(
+                            message.guild,
+                            ai_reply,
+                            settings,
+                            spoken_language="en",
+                        )
 
     await bot.process_commands(message)
 
@@ -785,12 +929,13 @@ async def voice(interaction: discord.Interaction, style: app_commands.Choice[str
     await interaction.response.send_message(f"Voice style set to **{VOICE_PROFILES[style.value]['label']}**.")
 
 
-@bot.tree.command(name="translate", description="Turn translation to English on or off before speaking")
-@app_commands.describe(mode="When on, non-English messages are translated to English before speech")
+@bot.tree.command(name="translate", description="Choose how translation works before speech")
+@app_commands.describe(mode="Off uses your set language, English translates to English, Original speaks the detected language")
 @app_commands.choices(
     mode=[
-        app_commands.Choice(name="On", value="on"),
         app_commands.Choice(name="Off", value="off"),
+        app_commands.Choice(name="English", value="english"),
+        app_commands.Choice(name="Original", value="original"),
     ]
 )
 async def translate_toggle(interaction: discord.Interaction, mode: app_commands.Choice[str]) -> None:
@@ -799,11 +944,70 @@ async def translate_toggle(interaction: discord.Interaction, mode: app_commands.
         return
 
     settings = get_guild_settings(interaction.guild.id)
-    settings["translate_enabled"] = mode.value == "on"
+    settings["translation_mode"] = mode.value
     save_settings()
-    await interaction.response.send_message(
-        f"Translation is now **{'ON' if settings['translate_enabled'] else 'OFF'}**."
-    )
+    await interaction.response.send_message(f"Translation mode is now **{mode.value}**.")
+
+
+@bot.tree.command(name="volume", description="Set playback volume from 0 to 100")
+async def volume(interaction: discord.Interaction, level: int) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    clamped_level = max(0, min(100, level))
+    settings = get_guild_settings(interaction.guild.id)
+    settings["volume"] = clamped_level
+    save_settings()
+    await interaction.response.send_message(f"Volume set to **{clamped_level}%**.")
+
+
+@bot.tree.command(name="readnotdeafened_on", description="Only read messages from users who are not deafened in the linked voice channel")
+async def readnotdeafened_on(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["read_not_deafened_only"] = True
+    save_settings()
+    await interaction.response.send_message("Not-deafened-only reading is now **ON**.")
+
+
+@bot.tree.command(name="readnotdeafened_off", description="Stop filtering reads by deafened state")
+async def readnotdeafened_off(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["read_not_deafened_only"] = False
+    save_settings()
+    await interaction.response.send_message("Not-deafened-only reading is now **OFF**.")
+
+
+@bot.tree.command(name="aireply_on", description="Enable short assistant-style voice replies")
+async def aireply_on(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["ai_reply_enabled"] = True
+    save_settings()
+    await interaction.response.send_message("AI reply mode is now **ON**.")
+
+
+@bot.tree.command(name="aireply_off", description="Disable assistant-style voice replies")
+async def aireply_off(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["ai_reply_enabled"] = False
+    save_settings()
+    await interaction.response.send_message("AI reply mode is now **OFF**.")
 
 
 @bot.tree.command(name="readmuted_on", description="Only read messages from muted users in the linked voice channel")
@@ -916,16 +1120,22 @@ async def tts_status(interaction: discord.Interaction) -> None:
     ignored = settings["ignored_users"]
     ignored_text = ", ".join(f"<@{user_id}>" for user_id in ignored) if ignored else "None"
     voice_label = VOICE_PROFILES[settings.get("voice_style", "female")]["label"]
-    translate_text = "On" if settings.get("translate_enabled") else "Off"
+    translate_text = settings.get("translation_mode", "off")
     read_muted_text = "On" if settings.get("read_muted_only") else "Off"
+    read_not_deafened_text = "On" if settings.get("read_not_deafened_only") else "Off"
+    ai_reply_text = "On" if settings.get("ai_reply_enabled") else "Off"
+    volume_text = f"{settings.get('volume', 100)}%"
 
     message = (
         f"**TTS Enabled:** {settings['tts_enabled']}\n"
         f"**No-Mic Channel:** {no_mic_text}\n"
         f"**Linked Voice Channel:** {linked_voice_text}\n"
         f"**Voice Style:** {voice_label}\n"
-        f"**Translate to English:** {translate_text}\n"
+        f"**Translation Mode:** {translate_text}\n"
+        f"**Volume:** {volume_text}\n"
         f"**Read Muted Only:** {read_muted_text}\n"
+        f"**Read Not Deafened Only:** {read_not_deafened_text}\n"
+        f"**AI Reply Mode:** {ai_reply_text}\n"
         f"**Language When Not Translating:** {settings.get('language', 'en')}\n"
         f"**Max Length:** {settings.get('max_length', 300)} chars\n"
         f"**Same VC Required:** {settings['same_vc_required']}\n"
@@ -966,8 +1176,11 @@ async def panel(interaction: discord.Interaction) -> None:
         name="Voice Options",
         value=(
             "`/voice` - Choose male, female, or neutral style\n"
-            "`/translate` - Translate non-English messages to English before speaking\n"
+            "`/translate` - Choose off, english, or original translation mode\n"
+            "`/volume` - Set playback volume from 0 to 100\n"
             "`/readmuted_on` / `/readmuted_off` - Read only muted users or everyone\n"
+            "`/readnotdeafened_on` / `/readnotdeafened_off` - Read only users who are not deafened\n"
+            "`/aireply_on` / `/aireply_off` - Toggle short assistant-style replies\n"
             "`/setlang <code>` - Language used when translation is off"
         ),
         inline=False,
