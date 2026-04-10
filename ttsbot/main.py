@@ -49,6 +49,11 @@ VOICE_PROFILES = {
         "ffmpeg_options": None,
     },
 }
+SOUND_FILES = {
+    "join": BASE_DIR / "assets" / "sounds" / "join.wav",
+    "leave": BASE_DIR / "assets" / "sounds" / "leave.wav",
+}
+ANNOUNCER_COOLDOWN_SECONDS = 45
 
 
 # --- Runtime dependency checks ---
@@ -126,6 +131,7 @@ guild_locks: dict[int, asyncio.Lock] = {}
 guild_last_spoke: dict[int, float] = {}
 guild_join_tasks: dict[int, asyncio.Task] = {}
 guild_leave_tasks: dict[int, asyncio.Task] = {}
+guild_last_announcement: dict[int, float] = {}
 command_sync_complete = False
 command_sync_lock = asyncio.Lock()
 
@@ -137,6 +143,10 @@ def default_settings() -> dict:
         "tts_enabled": True,
         "no_mic_channel_id": None,
         "voice_channel_id": None,
+        "personality_mode": "clean",
+        "announcer_enabled": False,
+        "join_sound_enabled": False,
+        "leave_sound_enabled": False,
         "read_muted_only": False,
         "read_not_deafened_only": False,
         "same_vc_required": True,
@@ -148,6 +158,15 @@ def default_settings() -> dict:
         "volume": 100,
         "voice_style": "female",
         "ai_reply_enabled": False,
+        "memory_enabled": False,
+        "memory": {
+            "host_name": "",
+            "meet_theme": "",
+            "preferred_mode": "clean",
+            "preferred_voice": "female",
+            "preferred_translation_mode": "off",
+            "preferred_volume": 100,
+        },
     }
 
 
@@ -162,22 +181,48 @@ def sanitize_settings(settings: dict) -> dict:
 
     if clean["language"] not in SUPPORTED_LANGUAGES:
         clean["language"] = "en"
+    if clean["personality_mode"] not in {"clean", "funny", "hype"}:
+        clean["personality_mode"] = "clean"
     if clean["translation_mode"] not in {"off", "english", "original"}:
         clean["translation_mode"] = "off"
     if clean["voice_style"] not in VOICE_PROFILES:
         clean["voice_style"] = "female"
     if not isinstance(clean["ignored_users"], list):
         clean["ignored_users"] = []
+    if not isinstance(clean["announcer_enabled"], bool):
+        clean["announcer_enabled"] = False
+    if not isinstance(clean["join_sound_enabled"], bool):
+        clean["join_sound_enabled"] = False
+    if not isinstance(clean["leave_sound_enabled"], bool):
+        clean["leave_sound_enabled"] = False
     if not isinstance(clean["read_muted_only"], bool):
         clean["read_muted_only"] = False
     if not isinstance(clean["read_not_deafened_only"], bool):
         clean["read_not_deafened_only"] = False
     if not isinstance(clean["ai_reply_enabled"], bool):
         clean["ai_reply_enabled"] = False
+    if not isinstance(clean["memory_enabled"], bool):
+        clean["memory_enabled"] = False
     try:
         clean["volume"] = max(0, min(100, int(clean["volume"])))
     except (TypeError, ValueError):
         clean["volume"] = 100
+
+    if not isinstance(clean["memory"], dict):
+        clean["memory"] = default_settings()["memory"].copy()
+    memory_defaults = default_settings()["memory"]
+    for key, value in memory_defaults.items():
+        clean["memory"].setdefault(key, value)
+    if clean["memory"]["preferred_mode"] not in {"clean", "funny", "hype"}:
+        clean["memory"]["preferred_mode"] = "clean"
+    if clean["memory"]["preferred_voice"] not in VOICE_PROFILES:
+        clean["memory"]["preferred_voice"] = "female"
+    if clean["memory"]["preferred_translation_mode"] not in {"off", "english", "original"}:
+        clean["memory"]["preferred_translation_mode"] = "off"
+    try:
+        clean["memory"]["preferred_volume"] = max(0, min(100, int(clean["memory"]["preferred_volume"])))
+    except (TypeError, ValueError):
+        clean["memory"]["preferred_volume"] = 100
 
     return clean
 
@@ -314,6 +359,49 @@ def member_matches_readnotdeafened(member: discord.Member, settings: dict) -> bo
     return not bool(voice_state.self_deaf or voice_state.deaf)
 
 
+def remember_preference(settings: dict, key: str, value) -> None:
+    if not settings.get("memory_enabled", False):
+        return
+    settings["memory"][key] = value
+
+
+def update_memory_from_message(message: discord.Message, settings: dict) -> None:
+    if not settings.get("memory_enabled", False):
+        return
+    if settings["no_mic_channel_id"] is None or message.channel.id != settings["no_mic_channel_id"]:
+        return
+
+    content = clean_message(message.content)
+    if not content:
+        return
+    changed = False
+
+    host_match = re.search(r"\bhost(?:ed)?(?: by| is|:)\s+([A-Za-z0-9 _-]{2,32})", content, flags=re.IGNORECASE)
+    if host_match:
+        host_name = host_match.group(1).strip()
+        if host_name and settings["memory"].get("host_name") != host_name:
+            settings["memory"]["host_name"] = host_name
+            changed = True
+
+    theme_match = re.search(r"\btheme(?: is|:)\s+([A-Za-z0-9 _-]{3,48})", content, flags=re.IGNORECASE)
+    if theme_match:
+        theme_name = theme_match.group(1).strip()
+        if theme_name and settings["memory"].get("meet_theme") != theme_name:
+            settings["memory"]["meet_theme"] = theme_name
+            changed = True
+
+    if changed:
+        save_settings()
+
+
+def personality_line(mode: str, clean: str, funny: str, hype: str) -> str:
+    if mode == "funny":
+        return funny
+    if mode == "hype":
+        return hype
+    return clean
+
+
 def detect_supported_language(text: str, fallback: str) -> str:
     try:
         detected = detect(text)
@@ -364,28 +452,129 @@ def should_trigger_ai_reply(message: discord.Message, settings: dict) -> bool:
     return prompt is not None and cleaned.lower().startswith(AI_REPLY_PREFIXES)
 
 
-def generate_ai_reply(prompt: str) -> str:
+def generate_ai_reply(prompt: str, settings: dict) -> str:
     lowered = prompt.lower()
     words = set(re.findall(r"[a-z']+", lowered))
+    mode = settings.get("personality_mode", "clean")
+    memory = settings.get("memory", {})
+    host_name = memory.get("host_name", "").strip()
+    meet_theme = memory.get("meet_theme", "").strip()
 
     if {"hello", "hey", "hi"} & words:
-        return "Hello. I am here and ready to read the channel."
+        return personality_line(
+            mode,
+            "Hello. I am here and ready to read the channel.",
+            "Hey there. I am tuned in and trying to stay out of trouble.",
+            "What is up. I am live, linked, and ready to run the lane.",
+        )
     if {"thank", "thanks", "ty"} & words:
-        return "You are welcome."
+        return personality_line(
+            mode,
+            "You are welcome.",
+            "Anytime. I work for compliments and clean audio.",
+            "Always. Happy to keep the meet moving.",
+        )
+    if "host" in lowered and host_name:
+        return personality_line(
+            mode,
+            f"The host on record is {host_name}.",
+            f"Host check. I have {host_name} in memory, so blame them respectfully.",
+            f"Host energy on deck. I have {host_name} logged as the host.",
+        )
+    if "theme" in lowered and meet_theme:
+        return personality_line(
+            mode,
+            f"The saved meet theme is {meet_theme}.",
+            f"The saved theme is {meet_theme}. That is a solid choice.",
+            f"Theme reminder. I have {meet_theme} saved for this meet.",
+        )
     if any(word in lowered for word in ("help", "what can you do", "commands")):
-        return "Use slash commands like panel, voice, translate, volume, and muted filters to control me."
+        return personality_line(
+            mode,
+            "Use slash commands like panel, voice, translate, volume, and the voice filters to control me.",
+            "Use panel if you want the command menu. I know voices, translation, volume, filters, and a little banter.",
+            "Use panel for the full control board. I can handle voice swaps, translation, volume, filters, and meet callouts.",
+        )
     if "voice" in lowered:
-        return "Use the voice command to switch between male, female, and neutral styles."
+        return personality_line(
+            mode,
+            "Use the voice command to switch between male, female, and neutral styles.",
+            "Use voice to swap the sound. Same bot, different vibe.",
+            "Use voice to change the tone. Male, female, or neutral, your call.",
+        )
     if "translate" in lowered:
-        return "Use the translate command to choose off, english, or original mode."
+        return personality_line(
+            mode,
+            "Use the translate command to choose off, english, or original mode.",
+            "Translate lets me keep it original or turn everything into English first.",
+            "Translate sets the lane: off, english, or original mode.",
+        )
     if "volume" in lowered or "loud" in lowered or "quiet" in lowered:
-        return "Use the volume command with a value from zero to one hundred."
+        return personality_line(
+            mode,
+            "Use the volume command with a value from zero to one hundred.",
+            "Use volume with a number from zero to one hundred. Please do not make me yell at everyone.",
+            "Use volume from zero to one hundred and set the level you want.",
+        )
     if "muted" in lowered or "deaf" in lowered:
-        return "I can filter by muted users or by users who are not deafened."
+        return personality_line(
+            mode,
+            "I can filter by muted users or by users who are not deafened.",
+            "I can filter for muted drivers or for people who are not deafened. Very selective, very fancy.",
+            "I can filter by muted users and by who is not deafened to keep the lane clean.",
+        )
     if "join" in lowered or "leave" in lowered:
-        return "Use join to link the voice channel and leave to disconnect."
+        return personality_line(
+            mode,
+            "Use join to link the voice channel and leave to disconnect.",
+            "Use join to lock me into the right lane and leave when it is time to roll out.",
+            "Use join to link the voice channel and leave to shut the booth down.",
+        )
 
-    return "I can read messages, translate them, change voices, and manage voice filters."
+    return personality_line(
+        mode,
+        "I can read messages, translate them, change voices, and manage voice filters.",
+        "I can read chat, swap voices, translate, and keep the meet from sounding boring.",
+        "I can read the chat, switch the vibe, translate on the fly, and keep the meet moving.",
+    )
+
+
+def should_announce(guild_id: int) -> bool:
+    now = asyncio.get_running_loop().time()
+    last = guild_last_announcement.get(guild_id, 0.0)
+    if now - last < ANNOUNCER_COOLDOWN_SECONDS:
+        return False
+    guild_last_announcement[guild_id] = now
+    return True
+
+
+def build_announcer_message(kind: str, settings: dict) -> str | None:
+    if not settings.get("announcer_enabled", False):
+        return None
+
+    mode = settings.get("personality_mode", "clean")
+    memory = settings.get("memory", {})
+    host_name = memory.get("host_name", "").strip()
+    meet_theme = memory.get("meet_theme", "").strip()
+
+    host_line = f" Host is {host_name}." if host_name else ""
+    theme_line = f" Theme is {meet_theme}." if meet_theme else ""
+
+    if kind == "welcome":
+        return personality_line(
+            mode,
+            f"Welcome to the meet.{host_line}{theme_line}",
+            f"Welcome to the meet. Keep it clean and keep the rev limiter on a leash.{host_line}{theme_line}",
+            f"Welcome to the meet. We are live in the lane.{host_line}{theme_line}",
+        )
+    if kind == "start":
+        return personality_line(
+            mode,
+            f"Meet reminder. Stay respectful and have fun.{theme_line}",
+            f"Meet reminder. Good vibes, clean pulls, and no acting wild for no reason.{theme_line}",
+            f"Meet start reminder. Keep it respectful, keep it moving, and enjoy the night.{theme_line}",
+        )
+    return None
 
 
 async def schedule_auto_join(guild: discord.Guild, channel: discord.VoiceChannel | discord.StageChannel) -> None:
@@ -414,6 +603,12 @@ async def schedule_auto_join(guild: discord.Guild, channel: discord.VoiceChannel
 
             await channel.connect()
             guild_last_spoke[guild.id] = asyncio.get_running_loop().time()
+            if settings.get("join_sound_enabled", False):
+                await play_sound_effect(guild, "join", settings)
+            if should_announce(guild.id):
+                announcement = build_announcer_message("welcome", settings)
+                if announcement:
+                    await play_tts_text(guild, announcement, settings, spoken_language="en")
             print(f"Auto-joined voice channel in guild {guild.id}")
         except asyncio.CancelledError:
             raise
@@ -438,6 +633,9 @@ async def schedule_delayed_leave(guild: discord.Guild) -> None:
             if count_real_members(voice_client.channel) > 0:
                 return
 
+            settings = get_guild_settings(guild.id)
+            if settings.get("leave_sound_enabled", False):
+                await play_sound_effect(guild, "leave", settings)
             await voice_client.disconnect()
             guild_last_spoke.pop(guild.id, None)
             print(f"Auto-left empty voice channel in guild {guild.id}")
@@ -580,6 +778,33 @@ def generate_tts_file(text: str, language: str, output_path: str) -> None:
     tts.save(output_path)
 
 
+def duck_current_source(voice_client: discord.VoiceClient) -> tuple[object | None, float | None]:
+    source = getattr(voice_client, "source", None)
+    if source is None or not hasattr(source, "volume"):
+        return None, None
+
+    try:
+        original_volume = float(source.volume)
+    except (TypeError, ValueError):
+        return None, None
+
+    ducked_volume = max(0.1, original_volume * 0.35)
+    try:
+        source.volume = ducked_volume
+        return source, original_volume
+    except Exception:
+        return None, None
+
+
+def restore_ducked_source(source: object | None, original_volume: float | None) -> None:
+    if source is None or original_volume is None or not hasattr(source, "volume"):
+        return
+    try:
+        source.volume = original_volume
+    except Exception:
+        pass
+
+
 async def play_tts_text(
     guild: discord.Guild,
     text: str,
@@ -613,6 +838,11 @@ async def play_tts_text(
         try:
             loop = asyncio.get_running_loop()
             guild_last_spoke[guild.id] = loop.time()
+            ducked_source = None
+            ducked_volume = None
+
+            if voice_client.is_playing():
+                ducked_source, ducked_volume = duck_current_source(voice_client)
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 mp3_path = Path(temp_dir) / "tts.mp3"
@@ -635,8 +865,39 @@ async def play_tts_text(
                 while voice_client.is_playing():
                     await asyncio.sleep(0.3)
 
+            restore_ducked_source(ducked_source, ducked_volume)
+
         except Exception as exc:
             print(f"TTS generation/playback error in guild {guild.id}: {exc}")
+            restore_ducked_source(ducked_source, ducked_volume)
+
+
+async def play_sound_effect(guild: discord.Guild, sound_name: str, settings: dict) -> None:
+    sound_path = SOUND_FILES.get(sound_name)
+    if sound_path is None or not sound_path.exists():
+        return
+
+    voice_client = guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        return
+
+    lock = get_guild_lock(guild.id)
+    async with lock:
+        voice_client = guild.voice_client
+        if not voice_client or not voice_client.is_connected():
+            return
+
+        try:
+            while voice_client.is_playing() or voice_client.is_paused():
+                await asyncio.sleep(0.1)
+
+            source = discord.FFmpegPCMAudio(str(sound_path))
+            wrapped_source = discord.PCMVolumeTransformer(source, volume=settings.get("volume", 100) / 100)
+            voice_client.play(wrapped_source)
+            while voice_client.is_playing():
+                await asyncio.sleep(0.1)
+        except Exception as exc:
+            print(f"Sound effect playback error in guild {guild.id}: {exc}")
 
 
 async def speak_message(message: discord.Message, settings: dict) -> None:
@@ -663,6 +924,9 @@ async def idle_check() -> None:
 
         if count_real_members(voice_client.channel) == 0:
             try:
+                settings = get_guild_settings(guild.id)
+                if settings.get("leave_sound_enabled", False):
+                    await play_sound_effect(guild, "leave", settings)
                 await voice_client.disconnect()
                 guild_last_spoke.pop(guild.id, None)
                 print(f"Fallback cleanup disconnected empty voice channel in guild {guild.id}")
@@ -690,15 +954,21 @@ async def on_ready() -> None:
 async def on_message(message: discord.Message) -> None:
     if message.guild is not None:
         settings = get_guild_settings(message.guild.id)
-        if not should_skip_message(message, settings):
+        update_memory_from_message(message, settings)
+
+        should_read_message = not should_skip_message(message, settings)
+        should_reply = should_trigger_ai_reply(message, settings)
+
+        if should_read_message or should_reply:
             ok, _ = await ensure_same_vc(message, settings)
             if ok:
-                await speak_message(message, settings)
+                if should_read_message:
+                    await speak_message(message, settings)
 
-                if should_trigger_ai_reply(message, settings):
+                if should_reply:
                     prompt = extract_ai_prompt(message)
                     if prompt:
-                        ai_reply = generate_ai_reply(prompt)
+                        ai_reply = generate_ai_reply(prompt, settings)
                         await play_tts_text(
                             message.guild,
                             ai_reply,
@@ -746,6 +1016,10 @@ async def on_voice_state_update(
         )
         if should_auto_join:
             await schedule_auto_join(guild, linked_channel)
+        elif voice_client and voice_client.is_connected() and should_announce(guild.id):
+            announcement = build_announcer_message("welcome", settings)
+            if announcement:
+                await play_tts_text(guild, announcement, settings, spoken_language="en")
 
     if current_channel and left_linked_channel and before_channel and before_channel.id == current_channel.id and moved_channels:
         if count_real_members(current_channel) == 0:
@@ -787,6 +1061,12 @@ async def join(interaction: discord.Interaction) -> None:
         settings["voice_channel_id"] = channel.id
         save_settings()
         guild_last_spoke[interaction.guild.id] = asyncio.get_running_loop().time()
+        if settings.get("join_sound_enabled", False):
+            await play_sound_effect(interaction.guild, "join", settings)
+        if settings.get("announcer_enabled", False) and should_announce(interaction.guild.id):
+            announcement = build_announcer_message("start", settings)
+            if announcement:
+                await play_tts_text(interaction.guild, announcement, settings, spoken_language="en")
         await interaction.followup.send(f"Joined **{channel.name}** and linked it for smart auto-join.")
     except Exception as exc:
         await interaction.followup.send(f"Failed to join VC: `{exc}`")
@@ -807,6 +1087,9 @@ async def leave(interaction: discord.Interaction) -> None:
     try:
         cancel_task(guild_leave_tasks, interaction.guild.id)
         cancel_task(guild_join_tasks, interaction.guild.id)
+        settings = get_guild_settings(interaction.guild.id)
+        if settings.get("leave_sound_enabled", False):
+            await play_sound_effect(interaction.guild, "leave", settings)
         await voice_client.disconnect()
         guild_last_spoke.pop(interaction.guild.id, None)
         await interaction.followup.send("Disconnected from voice channel.")
@@ -925,8 +1208,30 @@ async def voice(interaction: discord.Interaction, style: app_commands.Choice[str
 
     settings = get_guild_settings(interaction.guild.id)
     settings["voice_style"] = style.value
+    remember_preference(settings, "preferred_voice", style.value)
     save_settings()
     await interaction.response.send_message(f"Voice style set to **{VOICE_PROFILES[style.value]['label']}**.")
+
+
+@bot.tree.command(name="mode", description="Choose the announcer and AI reply personality mode")
+@app_commands.describe(style="Pick clean, funny, or hype")
+@app_commands.choices(
+    style=[
+        app_commands.Choice(name="Clean", value="clean"),
+        app_commands.Choice(name="Funny", value="funny"),
+        app_commands.Choice(name="Hype", value="hype"),
+    ]
+)
+async def mode(interaction: discord.Interaction, style: app_commands.Choice[str]) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["personality_mode"] = style.value
+    remember_preference(settings, "preferred_mode", style.value)
+    save_settings()
+    await interaction.response.send_message(f"Personality mode set to **{style.value}**.")
 
 
 @bot.tree.command(name="translate", description="Choose how translation works before speech")
@@ -945,6 +1250,7 @@ async def translate_toggle(interaction: discord.Interaction, mode: app_commands.
 
     settings = get_guild_settings(interaction.guild.id)
     settings["translation_mode"] = mode.value
+    remember_preference(settings, "preferred_translation_mode", mode.value)
     save_settings()
     await interaction.response.send_message(f"Translation mode is now **{mode.value}**.")
 
@@ -958,8 +1264,81 @@ async def volume(interaction: discord.Interaction, level: int) -> None:
     clamped_level = max(0, min(100, level))
     settings = get_guild_settings(interaction.guild.id)
     settings["volume"] = clamped_level
+    remember_preference(settings, "preferred_volume", clamped_level)
     save_settings()
     await interaction.response.send_message(f"Volume set to **{clamped_level}%**.")
+
+
+@bot.tree.command(name="announcer_on", description="Enable short meet-style announcements in the linked voice channel")
+async def announcer_on(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["announcer_enabled"] = True
+    save_settings()
+    await interaction.response.send_message("Announcer mode is now **ON**.")
+
+
+@bot.tree.command(name="announcer_off", description="Disable meet-style announcements in the linked voice channel")
+async def announcer_off(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["announcer_enabled"] = False
+    save_settings()
+    await interaction.response.send_message("Announcer mode is now **OFF**.")
+
+
+@bot.tree.command(name="joinsound_on", description="Enable a sound effect when the bot joins the linked voice channel")
+async def joinsound_on(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["join_sound_enabled"] = True
+    save_settings()
+    await interaction.response.send_message("Join sound is now **ON**.")
+
+
+@bot.tree.command(name="joinsound_off", description="Disable the join sound effect")
+async def joinsound_off(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["join_sound_enabled"] = False
+    save_settings()
+    await interaction.response.send_message("Join sound is now **OFF**.")
+
+
+@bot.tree.command(name="leavesound_on", description="Enable a sound effect when the bot leaves the linked voice channel")
+async def leavesound_on(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["leave_sound_enabled"] = True
+    save_settings()
+    await interaction.response.send_message("Leave sound is now **ON**.")
+
+
+@bot.tree.command(name="leavesound_off", description="Disable the leave sound effect")
+async def leavesound_off(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["leave_sound_enabled"] = False
+    save_settings()
+    await interaction.response.send_message("Leave sound is now **OFF**.")
 
 
 @bot.tree.command(name="readnotdeafened_on", description="Only read messages from users who are not deafened in the linked voice channel")
@@ -1008,6 +1387,34 @@ async def aireply_off(interaction: discord.Interaction) -> None:
     settings["ai_reply_enabled"] = False
     save_settings()
     await interaction.response.send_message("AI reply mode is now **OFF**.")
+
+
+@bot.tree.command(name="memory_on", description="Enable lightweight memory for assistant replies")
+async def memory_on(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["memory_enabled"] = True
+    remember_preference(settings, "preferred_mode", settings.get("personality_mode", "clean"))
+    remember_preference(settings, "preferred_voice", settings.get("voice_style", "female"))
+    remember_preference(settings, "preferred_translation_mode", settings.get("translation_mode", "off"))
+    remember_preference(settings, "preferred_volume", settings.get("volume", 100))
+    save_settings()
+    await interaction.response.send_message("Memory mode is now **ON**.")
+
+
+@bot.tree.command(name="memory_off", description="Disable lightweight memory for assistant replies")
+async def memory_off(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["memory_enabled"] = False
+    save_settings()
+    await interaction.response.send_message("Memory mode is now **OFF**.")
 
 
 @bot.tree.command(name="readmuted_on", description="Only read messages from muted users in the linked voice channel")
@@ -1120,22 +1527,37 @@ async def tts_status(interaction: discord.Interaction) -> None:
     ignored = settings["ignored_users"]
     ignored_text = ", ".join(f"<@{user_id}>" for user_id in ignored) if ignored else "None"
     voice_label = VOICE_PROFILES[settings.get("voice_style", "female")]["label"]
+    personality_text = settings.get("personality_mode", "clean")
     translate_text = settings.get("translation_mode", "off")
     read_muted_text = "On" if settings.get("read_muted_only") else "Off"
     read_not_deafened_text = "On" if settings.get("read_not_deafened_only") else "Off"
     ai_reply_text = "On" if settings.get("ai_reply_enabled") else "Off"
+    announcer_text = "On" if settings.get("announcer_enabled") else "Off"
+    memory_text = "On" if settings.get("memory_enabled") else "Off"
+    join_sound_text = "On" if settings.get("join_sound_enabled") else "Off"
+    leave_sound_text = "On" if settings.get("leave_sound_enabled") else "Off"
     volume_text = f"{settings.get('volume', 100)}%"
+    memory = settings.get("memory", {})
+    host_text = memory.get("host_name", "") or "Not set"
+    theme_text = memory.get("meet_theme", "") or "Not set"
 
     message = (
         f"**TTS Enabled:** {settings['tts_enabled']}\n"
         f"**No-Mic Channel:** {no_mic_text}\n"
         f"**Linked Voice Channel:** {linked_voice_text}\n"
         f"**Voice Style:** {voice_label}\n"
+        f"**Personality Mode:** {personality_text}\n"
         f"**Translation Mode:** {translate_text}\n"
         f"**Volume:** {volume_text}\n"
         f"**Read Muted Only:** {read_muted_text}\n"
         f"**Read Not Deafened Only:** {read_not_deafened_text}\n"
         f"**AI Reply Mode:** {ai_reply_text}\n"
+        f"**Announcer Mode:** {announcer_text}\n"
+        f"**Memory Mode:** {memory_text}\n"
+        f"**Join Sound:** {join_sound_text}\n"
+        f"**Leave Sound:** {leave_sound_text}\n"
+        f"**Saved Host:** {host_text}\n"
+        f"**Saved Theme:** {theme_text}\n"
         f"**Language When Not Translating:** {settings.get('language', 'en')}\n"
         f"**Max Length:** {settings.get('max_length', 300)} chars\n"
         f"**Same VC Required:** {settings['same_vc_required']}\n"
@@ -1176,11 +1598,16 @@ async def panel(interaction: discord.Interaction) -> None:
         name="Voice Options",
         value=(
             "`/voice` - Choose male, female, or neutral style\n"
+            "`/mode` - Choose clean, funny, or hype personality\n"
             "`/translate` - Choose off, english, or original translation mode\n"
             "`/volume` - Set playback volume from 0 to 100\n"
+            "`/announcer_on` / `/announcer_off` - Toggle short meet-style announcements\n"
+            "`/joinsound_on` / `/joinsound_off` - Toggle join sound effects\n"
+            "`/leavesound_on` / `/leavesound_off` - Toggle leave sound effects\n"
             "`/readmuted_on` / `/readmuted_off` - Read only muted users or everyone\n"
             "`/readnotdeafened_on` / `/readnotdeafened_off` - Read only users who are not deafened\n"
             "`/aireply_on` / `/aireply_off` - Toggle short assistant-style replies\n"
+            "`/memory_on` / `/memory_off` - Toggle lightweight server memory\n"
             "`/setlang <code>` - Language used when translation is off"
         ),
         inline=False,
