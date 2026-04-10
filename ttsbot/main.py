@@ -131,6 +131,7 @@ def default_settings() -> dict:
         "tts_enabled": True,
         "no_mic_channel_id": None,
         "voice_channel_id": None,
+        "read_muted_only": False,
         "same_vc_required": True,
         "smart_filter": True,
         "ignored_users": [],
@@ -253,6 +254,25 @@ def count_real_members(channel: discord.VoiceChannel | discord.StageChannel | No
     return sum(1 for member in channel.members if not member.bot)
 
 
+def member_is_in_channel(member: discord.Member, channel: discord.VoiceChannel | discord.StageChannel | None) -> bool:
+    return channel is not None and member.voice is not None and member.voice.channel is not None and member.voice.channel.id == channel.id
+
+
+def member_matches_readmuted(member: discord.Member, settings: dict) -> bool:
+    if not settings.get("read_muted_only", False):
+        return True
+
+    linked_channel = get_linked_voice_channel(member.guild)
+    if not member_is_in_channel(member, linked_channel):
+        return False
+
+    voice_state = member.voice
+    if voice_state is None:
+        return False
+
+    return bool(voice_state.self_mute or voice_state.mute)
+
+
 async def schedule_auto_join(guild: discord.Guild, channel: discord.VoiceChannel | discord.StageChannel) -> None:
     cancel_task(guild_leave_tasks, guild.id)
 
@@ -355,6 +375,10 @@ def should_skip_message(message: discord.Message, settings: dict) -> bool:
     if message.channel.id != settings["no_mic_channel_id"]:
         return True
     if message.author.id in settings["ignored_users"]:
+        return True
+    if not isinstance(message.author, discord.Member):
+        return True
+    if not member_matches_readmuted(message.author, settings):
         return True
 
     cleaned = clean_message(message.content)
@@ -554,16 +578,41 @@ async def on_voice_state_update(
     settings = get_guild_settings(guild.id)
     linked_channel = get_linked_voice_channel(guild)
     voice_client = guild.voice_client
-
-    if after.channel is not None and linked_channel and after.channel.id == linked_channel.id:
-        cancel_task(guild_leave_tasks, guild.id)
-        if settings["tts_enabled"] and settings["no_mic_channel_id"] is not None:
-            if voice_client is None or not voice_client.is_connected():
-                await schedule_auto_join(guild, linked_channel)
-
+    before_channel = before.channel if isinstance(before.channel, (discord.VoiceChannel, discord.StageChannel)) else None
+    after_channel = after.channel if isinstance(after.channel, (discord.VoiceChannel, discord.StageChannel)) else None
     current_channel = voice_client.channel if voice_client and voice_client.is_connected() else None
-    if current_channel and count_real_members(current_channel) == 0:
-        await schedule_delayed_leave(guild)
+
+    if current_channel and after_channel and after_channel.id == current_channel.id and not member.bot:
+        cancel_task(guild_leave_tasks, guild.id)
+
+    joined_linked_channel = linked_channel is not None and after_channel is not None and after_channel.id == linked_channel.id
+    left_linked_channel = linked_channel is not None and before_channel is not None and before_channel.id == linked_channel.id
+    moved_channels = before_channel != after_channel
+
+    if joined_linked_channel and moved_channels:
+        human_count = count_real_members(linked_channel)
+        if human_count > 0:
+            cancel_task(guild_leave_tasks, guild.id)
+
+        should_auto_join = (
+            human_count == 1
+            and settings["tts_enabled"]
+            and settings["no_mic_channel_id"] is not None
+            and (voice_client is None or not voice_client.is_connected())
+        )
+        if should_auto_join:
+            await schedule_auto_join(guild, linked_channel)
+
+    if current_channel and left_linked_channel and before_channel and before_channel.id == current_channel.id and moved_channels:
+        if count_real_members(current_channel) == 0:
+            await schedule_delayed_leave(guild)
+
+    if current_channel and after_channel is None and before_channel and before_channel.id == current_channel.id:
+        if count_real_members(current_channel) == 0:
+            await schedule_delayed_leave(guild)
+
+    if current_channel and count_real_members(current_channel) > 0:
+        cancel_task(guild_leave_tasks, guild.id)
 
 
 # --- Slash commands: voice connection and playback control ---
@@ -757,6 +806,30 @@ async def translate_toggle(interaction: discord.Interaction, mode: app_commands.
     )
 
 
+@bot.tree.command(name="readmuted_on", description="Only read messages from muted users in the linked voice channel")
+async def readmuted_on(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["read_muted_only"] = True
+    save_settings()
+    await interaction.response.send_message("Muted-only reading is now **ON**.")
+
+
+@bot.tree.command(name="readmuted_off", description="Read users normally instead of only muted users")
+async def readmuted_off(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    settings = get_guild_settings(interaction.guild.id)
+    settings["read_muted_only"] = False
+    save_settings()
+    await interaction.response.send_message("Muted-only reading is now **OFF**.")
+
+
 @bot.tree.command(name="tts_on", description="Turn TTS on")
 async def tts_on(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
@@ -844,6 +917,7 @@ async def tts_status(interaction: discord.Interaction) -> None:
     ignored_text = ", ".join(f"<@{user_id}>" for user_id in ignored) if ignored else "None"
     voice_label = VOICE_PROFILES[settings.get("voice_style", "female")]["label"]
     translate_text = "On" if settings.get("translate_enabled") else "Off"
+    read_muted_text = "On" if settings.get("read_muted_only") else "Off"
 
     message = (
         f"**TTS Enabled:** {settings['tts_enabled']}\n"
@@ -851,6 +925,7 @@ async def tts_status(interaction: discord.Interaction) -> None:
         f"**Linked Voice Channel:** {linked_voice_text}\n"
         f"**Voice Style:** {voice_label}\n"
         f"**Translate to English:** {translate_text}\n"
+        f"**Read Muted Only:** {read_muted_text}\n"
         f"**Language When Not Translating:** {settings.get('language', 'en')}\n"
         f"**Max Length:** {settings.get('max_length', 300)} chars\n"
         f"**Same VC Required:** {settings['same_vc_required']}\n"
@@ -892,6 +967,7 @@ async def panel(interaction: discord.Interaction) -> None:
         value=(
             "`/voice` - Choose male, female, or neutral style\n"
             "`/translate` - Translate non-English messages to English before speaking\n"
+            "`/readmuted_on` / `/readmuted_off` - Read only muted users or everyone\n"
             "`/setlang <code>` - Language used when translation is off"
         ),
         inline=False,
