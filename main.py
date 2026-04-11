@@ -314,14 +314,13 @@ async def idle_check():
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    # Wipe old global commands so they don't show up as duplicates
+    # Wipe global commands directly on Discord (does NOT touch local tree)
     try:
-        bot.tree.clear_commands(guild=None)
-        await bot.tree.sync()
-        print("Cleared global commands.")
+        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+        print("Cleared global commands from Discord.")
     except Exception as e:
         print(f"Failed to clear global commands: {e}")
-    # Sync guild-specific commands (instant, no duplicates)
+    # Sync all commands guild-specifically (instant, no duplicates)
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)
