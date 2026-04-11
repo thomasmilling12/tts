@@ -1,0 +1,7 @@
+discord.py
+python-dotenv
+PyNaCl
+gTTS
+pyogg
+deep-translator
+langdetect
