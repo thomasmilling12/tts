@@ -13,7 +13,7 @@ import os
 import re
 import bisect
 import json
-import time
+import timeyes
 import shutil
 import asyncio
 import tempfile
@@ -658,6 +658,39 @@ async def worker_health_check():
             ensure_worker(guild)
 
 
+# ─── Rotating status ──────────────────────────────────────────────────────────
+
+_STATUS_INDEX = 0
+_STATUS_MESSAGES = [
+    (discord.ActivityType.listening, "your messages 🎙️"),
+    (discord.ActivityType.playing,   "/panel for commands"),
+    (discord.ActivityType.watching,  "the meet 🚗"),
+    (discord.ActivityType.listening, "#no-mic channel"),
+]
+
+@tasks.loop(seconds=30)
+async def rotate_status():
+    """Cycle through status messages every 30 seconds."""
+    global _STATUS_INDEX
+    kind, text = _STATUS_MESSAGES[_STATUS_INDEX % len(_STATUS_MESSAGES)]
+    _STATUS_INDEX += 1
+
+    # Show live queue total across all guilds as a bonus
+    total_queued = sum(get_queue(g.id).size() for g in bot.guilds)
+    if total_queued > 0:
+        activity = discord.Activity(
+            type=discord.ActivityType.listening,
+            name=f"{total_queued} message{'s' if total_queued != 1 else ''} in queue"
+        )
+    else:
+        activity = discord.Activity(type=kind, name=text)
+
+    try:
+        await bot.change_presence(status=discord.Status.online, activity=activity)
+    except Exception:
+        pass
+
+
 # ─── Bot events ───────────────────────────────────────────────────────────────
 
 @bot.event
@@ -683,6 +716,13 @@ async def on_ready():
 
     idle_check.start()
     worker_health_check.start()
+    rotate_status.start()
+
+    # Set initial presence immediately so the bot shows online right away
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Activity(type=discord.ActivityType.listening, name="your messages 🎙️")
+    )
 
 
 @bot.event
