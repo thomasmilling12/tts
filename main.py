@@ -29,6 +29,8 @@ import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from gtts import gTTS
+import edge_tts
+from deep_translator import GoogleTranslator
 
 
 # ─── Opus & ffmpeg ────────────────────────────────────────────────────────────
@@ -111,6 +113,57 @@ def cache_put(text: str, lang: str, slow: bool, data: bytes) -> None:
     _tts_cache.move_to_end(key)
     while len(_tts_cache) > _TTS_CACHE_MAX:
         _tts_cache.popitem(last=False)
+
+
+# ─── Edge TTS voice map (language code → best matching neural voice) ──────────
+# Used when tts_engine is "edge". Fallback to gTTS if the voice is unavailable.
+
+EDGE_VOICE_MAP: dict[str, str] = {
+    "en":    "en-US-AriaNeural",
+    "en-gb": "en-GB-SoniaNeural",
+    "en-au": "en-AU-NatashaNeural",
+    "es":    "es-ES-ElviraNeural",
+    "fr":    "fr-FR-DeniseNeural",
+    "de":    "de-DE-KatjaNeural",
+    "it":    "it-IT-ElsaNeural",
+    "pt":    "pt-BR-FranciscaNeural",
+    "ja":    "ja-JP-NanamiNeural",
+    "ko":    "ko-KR-SunHiNeural",
+    "zh":    "zh-CN-XiaoxiaoNeural",
+    "ru":    "ru-RU-SvetlanaNeural",
+    "ar":    "ar-SA-ZariyahNeural",
+    "hi":    "hi-IN-SwaraNeural",
+    "nl":    "nl-NL-ColetteNeural",
+    "pl":    "pl-PL-ZofiaNeural",
+    "tr":    "tr-TR-EmelNeural",
+}
+
+DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
+
+
+def lang_to_edge_voice(lang: str) -> str:
+    """Return the best edge-tts voice for a given language code."""
+    return EDGE_VOICE_MAP.get(lang.lower(), DEFAULT_EDGE_VOICE)
+
+
+# ─── Translation helper ────────────────────────────────────────────────────────
+
+async def translate_text(text: str, target_lang: str) -> str:
+    """
+    Translate text to target_lang using Google Translate (no API key needed).
+    Runs in an executor since deep-translator is synchronous.
+    Falls back to original text if translation fails.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        translated = await loop.run_in_executor(
+            None,
+            lambda: GoogleTranslator(source="auto", target=target_lang).translate(text)
+        )
+        return translated or text
+    except Exception as e:
+        print(f"[Translate] Failed: {e}")
+        return text
 
 
 # ─── Queue item ───────────────────────────────────────────────────────────────
@@ -250,6 +303,12 @@ def default_settings() -> dict:
         "host_mode":            False,
         "host_interrupts":      False,
         "follow_mode":          False,
+        # TTS engine
+        "tts_engine":           "edge",          # "edge" (neural) or "gtts"
+        "edge_voice":           DEFAULT_EDGE_VOICE,
+        # Translation
+        "auto_translate":       False,
+        "translate_target":     "en",
     }
 
 
@@ -451,6 +510,21 @@ async def tts_worker(guild: discord.Guild):
 
             print(f"[Playback] Starting in {guild.name}: {cleaned[:60]}...")
 
+            # Determine which TTS engine and voice to use for this guild
+            s          = get_guild_settings(guild.id)
+            engine     = s.get("tts_engine", "edge")
+            guild_lang = s.get("language", "en")
+
+            # If this item's language matches the guild default, use the configured voice.
+            # If it's a per-user language override, pick the matching neural voice.
+            if item.lang == guild_lang:
+                edge_voice = s.get("edge_voice", DEFAULT_EDGE_VOICE)
+            else:
+                edge_voice = lang_to_edge_voice(item.lang)
+
+            # Cache key includes engine so gTTS and edge-tts entries don't collide
+            cache_key_extra = f"{engine}:{edge_voice}"
+
             # Try to play — up to 3 attempts, with audio cache
             success = False
             for attempt in range(3):
@@ -458,16 +532,29 @@ async def tts_worker(guild: discord.Guild):
                     with tempfile.TemporaryDirectory() as tmp:
                         mp3 = Path(tmp) / "tts.mp3"
 
-                        # Check cache first to avoid redundant gTTS calls
-                        cached = cache_get(cleaned, item.lang, item.slow)
+                        # Check cache to avoid regenerating the same audio
+                        cached = cache_get(cleaned, f"{item.lang}_{cache_key_extra}", item.slow)
                         if cached:
                             mp3.write_bytes(cached)
+                        elif engine == "edge":
+                            # Edge TTS — natural neural voices, async native
+                            try:
+                                communicate = edge_tts.Communicate(cleaned, edge_voice)
+                                await communicate.save(str(mp3))
+                                cache_put(cleaned, f"{item.lang}_{cache_key_extra}", item.slow, mp3.read_bytes())
+                            except Exception as edge_err:
+                                # Fall back to gTTS if edge-tts fails for any reason
+                                print(f"[Edge TTS] Failed, falling back to gTTS: {edge_err}")
+                                def _gtts_fallback():
+                                    gTTS(text=cleaned, lang=item.lang, slow=item.slow).save(str(mp3))
+                                await loop.run_in_executor(None, _gtts_fallback)
+                                cache_put(cleaned, f"{item.lang}_{cache_key_extra}", item.slow, mp3.read_bytes())
                         else:
-                            # Generate TTS in executor so the event loop stays free
+                            # gTTS — runs in executor so event loop stays free
                             def _generate():
                                 gTTS(text=cleaned, lang=item.lang, slow=item.slow).save(str(mp3))
                             await loop.run_in_executor(None, _generate)
-                            cache_put(cleaned, item.lang, item.slow, mp3.read_bytes())
+                            cache_put(cleaned, f"{item.lang}_{cache_key_extra}", item.slow, mp3.read_bytes())
 
                         done = asyncio.Event()
 
@@ -757,6 +844,19 @@ async def on_message(message: discord.Message):
                 full_text = f"{display} {prefix} {message.content}"
             else:
                 full_text = message.content
+
+            # Auto-translate: translate the message content before speaking
+            # Translation runs on the raw message, not on the "username says" prefix
+            if s.get("auto_translate", False):
+                target = s.get("translate_target", "en")
+                raw_translated = await translate_text(message.content, target)
+                if s["say_name"]:
+                    prefix    = s.get("voice_prefix", "says")
+                    full_text = f"{display} {prefix} {raw_translated}"
+                else:
+                    full_text = raw_translated
+                # Use the target language for TTS so the voice matches
+                lang = target
 
             # Host priority
             host_id   = s.get("host_id")
@@ -1065,6 +1165,96 @@ async def cmd_speed_normal(interaction: discord.Interaction):
     await interaction.response.send_message("TTS speed: **normal**.")
 
 
+# ── TTS engine & voice ────────────────────────────────────────────────────────
+
+@bot.tree.command(name="ttsengine", description="Switch TTS engine: 'edge' (neural, better) or 'gtts' (classic)")
+async def cmd_ttsengine(interaction: discord.Interaction, engine: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    engine = engine.lower().strip()
+    if engine not in ("edge", "gtts"):
+        await interaction.response.send_message("Choose `edge` or `gtts`.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["tts_engine"] = engine; save_settings()
+    _tts_cache.clear()  # clear cache so new engine is used immediately
+    label = "Edge TTS (neural voices 🎙️)" if engine == "edge" else "gTTS (classic)"
+    await interaction.response.send_message(f"TTS engine set to **{label}**.")
+
+
+@bot.tree.command(name="setvoice", description="Set the Edge TTS voice (e.g. en-US-GuyNeural, en-GB-SoniaNeural)")
+async def cmd_setvoice(interaction: discord.Interaction, voice: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    voice = voice.strip()
+    # Quick sanity check — edge-tts voice names always contain "Neural"
+    if "Neural" not in voice:
+        await interaction.response.send_message(
+            "That doesn't look like a valid Edge TTS voice name.\n"
+            "Examples: `en-US-AriaNeural`, `en-US-GuyNeural`, `en-GB-SoniaNeural`\n"
+            "Full list: <https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support>",
+            ephemeral=True
+        ); return
+    s = get_guild_settings(interaction.guild.id)
+    s["edge_voice"]  = voice
+    s["tts_engine"]  = "edge"  # auto-switch to edge when a voice is set
+    save_settings()
+    _tts_cache.clear()
+    await interaction.response.send_message(f"Voice set to `{voice}`. Make sure `/ttsengine` is set to `edge`.")
+
+
+@bot.tree.command(name="voicelist", description="Show common Edge TTS voice options")
+async def cmd_voicelist(interaction: discord.Interaction):
+    lines = "\n".join(
+        f"`{v}` — {lang.upper()}" for lang, v in EDGE_VOICE_MAP.items()
+    )
+    embed = discord.Embed(
+        title="🎙️ Built-in Edge TTS Voices",
+        description=lines,
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Set a voice",
+        value="Use `/setvoice <name>` with any voice above, or find more at "
+              "[Microsoft Voice List](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support)",
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── Translation ────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="translate", description="Toggle auto-translation of messages before reading them aloud")
+async def cmd_translate(interaction: discord.Interaction, enabled: bool):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["auto_translate"] = enabled; save_settings()
+    target = s.get("translate_target", "en")
+    if enabled:
+        await interaction.response.send_message(
+            f"Auto-translate **ON** — messages will be translated to `{target}` before speaking.\n"
+            f"Change the target language with `/settranslatetarget`."
+        )
+    else:
+        await interaction.response.send_message("Auto-translate **OFF**.")
+
+
+@bot.tree.command(name="settranslatetarget", description="Set the language messages are translated TO (default: en)")
+async def cmd_settranslatetarget(interaction: discord.Interaction, language: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    lang = language.strip().lower()
+    s["translate_target"] = lang
+    # Also update edge voice to match
+    s["edge_voice"] = lang_to_edge_voice(lang)
+    save_settings()
+    _tts_cache.clear()
+    await interaction.response.send_message(
+        f"Translate target set to `{lang}`. Voice updated to `{s['edge_voice']}`."
+    )
+
+
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="setnomic", description="Set the text channel the bot reads aloud")
@@ -1310,13 +1500,21 @@ async def cmd_status(interaction: discord.Interaction):
         f"**Worker alive:** {'Yes' if worker_ok else 'No'}"
     ), inline=True)
 
+    engine    = s.get("tts_engine", "edge")
+    edge_voice_name = s.get("edge_voice", DEFAULT_EDGE_VOICE)
+    translate_on    = s.get("auto_translate", False)
+    translate_tgt   = s.get("translate_target", "en")
+
     embed.add_field(name="⚙️ Core", value=(
         f"**TTS:** {oo(s['tts_enabled'])}\n"
         f"**No-mic channel:** {ch(s['no_mic_channel_id'])}\n"
         f"**Language:** `{s.get('language', 'en')}`\n"
+        f"**Engine:** `{engine}`\n"
+        f"**Voice:** `{edge_voice_name}`\n"
         f"**Speed:** {'Slow' if s.get('slow_tts') else 'Normal'}\n"
         f"**Max length:** {s.get('max_length', 300)} chars\n"
-        f"**Idle timeout:** {timeout_str}"
+        f"**Idle timeout:** {timeout_str}\n"
+        f"**Translate:** {oo(translate_on)} → `{translate_tgt}`"
     ), inline=True)
 
     embed.add_field(name="👤 Name", value=(
@@ -1380,6 +1578,15 @@ async def cmd_panel(interaction: discord.Interaction):
         "`/setmaxlength <n>`\n"
         "`/setcooldown <s>`\n"
         "`/speed_slow` / `/speed_normal`"
+    ), inline=False)
+    embed.add_field(name="🎙️ Voice Engine", value=(
+        "`/ttsengine edge|gtts` — Switch engine\n"
+        "`/setvoice <name>` — Set neural voice\n"
+        "`/voicelist` — See available voices"
+    ), inline=False)
+    embed.add_field(name="🌐 Translation", value=(
+        "`/translate on|off` — Auto-translate messages\n"
+        "`/settranslatetarget <lang>` — Language to translate to"
     ), inline=False)
     embed.add_field(name="👤 Name & Users", value=(
         "`/sayname_on` / `/sayname_off`\n"
