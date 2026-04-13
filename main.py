@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from gtts import gTTS
@@ -144,6 +145,61 @@ DEFAULT_EDGE_VOICE = "en-US-AriaNeural"
 def lang_to_edge_voice(lang: str) -> str:
     """Return the best edge-tts voice for a given language code."""
     return EDGE_VOICE_MAP.get(lang.lower(), DEFAULT_EDGE_VOICE)
+
+
+# ─── Dropdown choice lists ────────────────────────────────────────────────────
+# Reused across multiple commands — Discord supports up to 25 choices per param.
+
+LANGUAGE_CHOICES = [
+    app_commands.Choice(name="English (US)",        value="en"),
+    app_commands.Choice(name="English (UK)",        value="en-gb"),
+    app_commands.Choice(name="English (Australia)", value="en-au"),
+    app_commands.Choice(name="Spanish",             value="es"),
+    app_commands.Choice(name="French",              value="fr"),
+    app_commands.Choice(name="German",              value="de"),
+    app_commands.Choice(name="Italian",             value="it"),
+    app_commands.Choice(name="Portuguese (Brazil)", value="pt"),
+    app_commands.Choice(name="Japanese",            value="ja"),
+    app_commands.Choice(name="Korean",              value="ko"),
+    app_commands.Choice(name="Chinese (Mandarin)",  value="zh"),
+    app_commands.Choice(name="Russian",             value="ru"),
+    app_commands.Choice(name="Arabic",              value="ar"),
+    app_commands.Choice(name="Hindi",               value="hi"),
+    app_commands.Choice(name="Dutch",               value="nl"),
+    app_commands.Choice(name="Polish",              value="pl"),
+    app_commands.Choice(name="Turkish",             value="tr"),
+]
+
+VOICE_CHOICES = [
+    app_commands.Choice(name="Aria — EN US Female (default)",  value="en-US-AriaNeural"),
+    app_commands.Choice(name="Guy — EN US Male",               value="en-US-GuyNeural"),
+    app_commands.Choice(name="Sonia — EN UK Female",           value="en-GB-SoniaNeural"),
+    app_commands.Choice(name="Ryan — EN UK Male",              value="en-GB-RyanNeural"),
+    app_commands.Choice(name="Natasha — EN AU Female",         value="en-AU-NatashaNeural"),
+    app_commands.Choice(name="William — EN AU Male",           value="en-AU-WilliamNeural"),
+    app_commands.Choice(name="Elvira — Spanish Female",        value="es-ES-ElviraNeural"),
+    app_commands.Choice(name="Alvaro — Spanish Male",          value="es-ES-AlvaroNeural"),
+    app_commands.Choice(name="Denise — French Female",         value="fr-FR-DeniseNeural"),
+    app_commands.Choice(name="Henri — French Male",            value="fr-FR-HenriNeural"),
+    app_commands.Choice(name="Katja — German Female",          value="de-DE-KatjaNeural"),
+    app_commands.Choice(name="Conrad — German Male",           value="de-DE-ConradNeural"),
+    app_commands.Choice(name="Elsa — Italian Female",          value="it-IT-ElsaNeural"),
+    app_commands.Choice(name="Francisca — Portuguese Female",  value="pt-BR-FranciscaNeural"),
+    app_commands.Choice(name="Nanami — Japanese Female",       value="ja-JP-NanamiNeural"),
+    app_commands.Choice(name="SunHi — Korean Female",          value="ko-KR-SunHiNeural"),
+    app_commands.Choice(name="Xiaoxiao — Chinese Female",      value="zh-CN-XiaoxiaoNeural"),
+    app_commands.Choice(name="Svetlana — Russian Female",      value="ru-RU-SvetlanaNeural"),
+    app_commands.Choice(name="Zariyah — Arabic Female",        value="ar-SA-ZariyahNeural"),
+    app_commands.Choice(name="Swara — Hindi Female",           value="hi-IN-SwaraNeural"),
+    app_commands.Choice(name="Colette — Dutch Female",         value="nl-NL-ColetteNeural"),
+    app_commands.Choice(name="Zofia — Polish Female",          value="pl-PL-ZofiaNeural"),
+    app_commands.Choice(name="Emel — Turkish Female",          value="tr-TR-EmelNeural"),
+]
+
+ENGINE_CHOICES = [
+    app_commands.Choice(name="Edge TTS — Natural neural voices (recommended)", value="edge"),
+    app_commands.Choice(name="gTTS — Classic Google TTS (fallback)",           value="gtts"),
+]
 
 
 # ─── Translation helper ────────────────────────────────────────────────────────
@@ -1167,55 +1223,44 @@ async def cmd_speed_normal(interaction: discord.Interaction):
 
 # ── TTS engine & voice ────────────────────────────────────────────────────────
 
-@bot.tree.command(name="ttsengine", description="Switch TTS engine: 'edge' (neural, better) or 'gtts' (classic)")
+@bot.tree.command(name="ttsengine", description="Switch the TTS speech engine")
+@app_commands.choices(engine=ENGINE_CHOICES)
 async def cmd_ttsengine(interaction: discord.Interaction, engine: str):
     if not has_permission(interaction):
         await interaction.response.send_message("No permission.", ephemeral=True); return
-    engine = engine.lower().strip()
-    if engine not in ("edge", "gtts"):
-        await interaction.response.send_message("Choose `edge` or `gtts`.", ephemeral=True); return
     s = get_guild_settings(interaction.guild.id)
     s["tts_engine"] = engine; save_settings()
-    _tts_cache.clear()  # clear cache so new engine is used immediately
-    label = "Edge TTS (neural voices 🎙️)" if engine == "edge" else "gTTS (classic)"
+    _tts_cache.clear()
+    label = "Edge TTS — neural voices 🎙️" if engine == "edge" else "gTTS — classic"
     await interaction.response.send_message(f"TTS engine set to **{label}**.")
 
 
-@bot.tree.command(name="setvoice", description="Set the Edge TTS voice (e.g. en-US-GuyNeural, en-GB-SoniaNeural)")
+@bot.tree.command(name="setvoice", description="Set the Edge TTS neural voice")
+@app_commands.choices(voice=VOICE_CHOICES)
 async def cmd_setvoice(interaction: discord.Interaction, voice: str):
     if not has_permission(interaction):
         await interaction.response.send_message("No permission.", ephemeral=True); return
-    voice = voice.strip()
-    # Quick sanity check — edge-tts voice names always contain "Neural"
-    if "Neural" not in voice:
-        await interaction.response.send_message(
-            "That doesn't look like a valid Edge TTS voice name.\n"
-            "Examples: `en-US-AriaNeural`, `en-US-GuyNeural`, `en-GB-SoniaNeural`\n"
-            "Full list: <https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support>",
-            ephemeral=True
-        ); return
     s = get_guild_settings(interaction.guild.id)
-    s["edge_voice"]  = voice
-    s["tts_engine"]  = "edge"  # auto-switch to edge when a voice is set
+    s["edge_voice"] = voice
+    s["tts_engine"] = "edge"   # auto-switch to Edge when a voice is set
     save_settings()
     _tts_cache.clear()
-    await interaction.response.send_message(f"Voice set to `{voice}`. Make sure `/ttsengine` is set to `edge`.")
+    # Find the display name for a friendlier confirmation message
+    label = next((c.name for c in VOICE_CHOICES if c.value == voice), voice)
+    await interaction.response.send_message(f"Voice set to **{label}** (`{voice}`).")
 
 
-@bot.tree.command(name="voicelist", description="Show common Edge TTS voice options")
+@bot.tree.command(name="voicelist", description="Show all available Edge TTS voice options")
 async def cmd_voicelist(interaction: discord.Interaction):
-    lines = "\n".join(
-        f"`{v}` — {lang.upper()}" for lang, v in EDGE_VOICE_MAP.items()
-    )
+    lines = "\n".join(f"`{c.value}` — {c.name}" for c in VOICE_CHOICES)
     embed = discord.Embed(
-        title="🎙️ Built-in Edge TTS Voices",
+        title="🎙️ Available Edge TTS Voices",
         description=lines,
         color=discord.Color.blurple()
     )
     embed.add_field(
-        name="Set a voice",
-        value="Use `/setvoice <name>` with any voice above, or find more at "
-              "[Microsoft Voice List](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support)",
+        name="How to set",
+        value="Use `/setvoice` and pick from the dropdown, or use `/ttsengine` to switch engines.",
         inline=False
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1239,19 +1284,20 @@ async def cmd_translate(interaction: discord.Interaction, enabled: bool):
         await interaction.response.send_message("Auto-translate **OFF**.")
 
 
-@bot.tree.command(name="settranslatetarget", description="Set the language messages are translated TO (default: en)")
+@bot.tree.command(name="settranslatetarget", description="Set the language messages are translated TO before being read aloud")
+@app_commands.choices(language=LANGUAGE_CHOICES)
 async def cmd_settranslatetarget(interaction: discord.Interaction, language: str):
     if not has_permission(interaction):
         await interaction.response.send_message("No permission.", ephemeral=True); return
     s = get_guild_settings(interaction.guild.id)
-    lang = language.strip().lower()
-    s["translate_target"] = lang
-    # Also update edge voice to match
-    s["edge_voice"] = lang_to_edge_voice(lang)
+    s["translate_target"] = language
+    s["edge_voice"]        = lang_to_edge_voice(language)
     save_settings()
     _tts_cache.clear()
+    label = next((c.name for c in LANGUAGE_CHOICES if c.value == language), language)
     await interaction.response.send_message(
-        f"Translate target set to `{lang}`. Voice updated to `{s['edge_voice']}`."
+        f"Translate target set to **{label}** (`{language}`). "
+        f"Voice updated to `{s['edge_voice']}`."
     )
 
 
@@ -1266,21 +1312,33 @@ async def cmd_setnomic(interaction: discord.Interaction, channel: discord.TextCh
     await interaction.response.send_message(f"Reading messages from {channel.mention}.")
 
 
-@bot.tree.command(name="setlang", description="Set the server-wide TTS language (en, es, fr, de, ja…)")
+@bot.tree.command(name="setlang", description="Set the server-wide TTS language")
+@app_commands.choices(language=LANGUAGE_CHOICES)
 async def cmd_setlang(interaction: discord.Interaction, language: str):
     if not has_permission(interaction):
         await interaction.response.send_message("No permission.", ephemeral=True); return
     s = get_guild_settings(interaction.guild.id)
-    s["language"] = language.strip().lower(); save_settings()
-    await interaction.response.send_message(f"Server language set to `{language}`.")
+    s["language"] = language
+    # Also update the Edge voice to match the new language
+    s["edge_voice"] = lang_to_edge_voice(language)
+    save_settings()
+    label = next((c.name for c in LANGUAGE_CHOICES if c.value == language), language)
+    await interaction.response.send_message(
+        f"Server language set to **{label}** (`{language}`). "
+        f"Voice updated to `{s['edge_voice']}`."
+    )
 
 
-@bot.tree.command(name="setmylang", description="Set your personal TTS language (overrides server default)")
+@bot.tree.command(name="setmylang", description="Set your personal TTS language — overrides the server default")
+@app_commands.choices(language=LANGUAGE_CHOICES)
 async def cmd_setmylang(interaction: discord.Interaction, language: str):
     s = get_guild_settings(interaction.guild.id)
-    s.setdefault("user_languages", {})[str(interaction.user.id)] = language.strip().lower()
+    s.setdefault("user_languages", {})[str(interaction.user.id)] = language
     save_settings()
-    await interaction.response.send_message(f"Your TTS language: `{language}`.", ephemeral=True)
+    label = next((c.name for c in LANGUAGE_CHOICES if c.value == language), language)
+    await interaction.response.send_message(
+        f"Your TTS language set to **{label}** (`{language}`).", ephemeral=True
+    )
 
 
 @bot.tree.command(name="clearmylang", description="Remove your personal language, use server default")
