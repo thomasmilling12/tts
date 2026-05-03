@@ -1056,10 +1056,13 @@ async def idle_check():
         last = guild_last_activity.get(guild.id, now)
         if (now - last) >= timeout:
             try:
+                guild_intentional_leave.add(guild.id)   # suppress auto-rejoin after idle
+                guild_auto_rejoin_channel.pop(guild.id, None)
                 await vc.disconnect()
                 guild_last_activity.pop(guild.id, None)
                 print(f"[Idle] Left {guild.name} after {timeout}s of inactivity")
             except Exception as e:
+                guild_intentional_leave.discard(guild.id)
                 print(f"[Idle] Disconnect error in {guild.name}: {e}")
 
 
@@ -1262,12 +1265,14 @@ async def _auto_rejoin(guild: discord.Guild, channel_id: int):
     await asyncio.sleep(3)
     vc = guild.voice_client
     if vc and vc.is_connected():
-        return  # already reconnected somehow
+        return  # discord.py already reconnected internally — don't create a second client
     channel = guild.get_channel(channel_id)
     if channel is None:
         return
     try:
-        await channel.connect(timeout=10.0, reconnect=True)
+        # Use safe_join so we move_to if a stale client exists, rather than opening
+        # a second voice connection (which would terminate the first and loop forever).
+        await safe_join(channel, guild)
         print(f"[AutoRejoin] Rejoined {channel.name} in {guild.name}")
         touch_activity(guild.id)
     except Exception as e:
