@@ -1154,14 +1154,14 @@ async def on_message(message: discord.Message):
 
     s = get_guild_settings(message.guild.id)
 
-    # ── DEBUG: trace every non-bot guild message ──────────────────────────────
-    if not message.author.bot:
-        vc = message.guild.voice_client
-        print(
-            f"[DEBUG] msg from {message.author} in #{message.channel.name} | "
-            f"tts_enabled={s['tts_enabled']} nomic_ch={s['no_mic_channel_id']} "
-            f"this_ch={message.channel.id} vc_connected={vc.is_connected() if vc else 'NO VC'}"
-        )
+    # ── DEBUG: trace ALL guild messages (bots included) ──────────────────────
+    vc = message.guild.voice_client
+    print(
+        f"[DEBUG] msg bot={message.author.bot} from {message.author} in #{message.channel.name} | "
+        f"tts={s['tts_enabled']} nomic={s['no_mic_channel_id']} "
+        f"ch={message.channel.id} vc={vc.is_connected() if vc else 'NONE'}",
+        flush=True,
+    )
     # ─────────────────────────────────────────────────────────────────────────
 
     if not should_skip(message, s):
