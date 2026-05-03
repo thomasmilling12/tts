@@ -101,10 +101,13 @@ _TTS_CACHE_MAX = 50
 
 
 def cache_get(text: str, lang: str, slow: bool) -> Optional[bytes]:
+    global _cache_hits, _cache_misses
     key = (text, lang, slow)
     if key in _tts_cache:
         _tts_cache.move_to_end(key)
+        _cache_hits += 1
         return _tts_cache[key]
+    _cache_misses += 1
     return None
 
 
@@ -200,6 +203,84 @@ ENGINE_CHOICES = [
     app_commands.Choice(name="Edge TTS — Natural neural voices (recommended)", value="edge"),
     app_commands.Choice(name="gTTS — Classic Google TTS (fallback)",           value="gtts"),
 ]
+
+SPEED_CHOICES = [
+    app_commands.Choice(name="Very Slow  (-50%)", value="-50%"),
+    app_commands.Choice(name="Slow       (-25%)", value="-25%"),
+    app_commands.Choice(name="Normal     (+0%)",  value="+0%"),
+    app_commands.Choice(name="Fast       (+25%)", value="+25%"),
+    app_commands.Choice(name="Very Fast  (+50%)", value="+50%"),
+]
+
+# ─── Chat abbreviation expansion ──────────────────────────────────────────────
+# Expands common chat-speak so TTS reads it naturally.
+# Only applied as whole-word matches to avoid replacing partial words.
+
+_ABBREVIATIONS: dict[str, str] = {
+    "lol":   "laughing out loud",
+    "lmao":  "laughing my ass off",
+    "lmfao": "laughing my freaking ass off",
+    "brb":   "be right back",
+    "afk":   "away from keyboard",
+    "gtg":   "got to go",
+    "omg":   "oh my god",
+    "wtf":   "what the heck",
+    "ngl":   "not gonna lie",
+    "imo":   "in my opinion",
+    "imho":  "in my honest opinion",
+    "tbh":   "to be honest",
+    "rn":    "right now",
+    "irl":   "in real life",
+    "idk":   "I don't know",
+    "iirc":  "if I recall correctly",
+    "fyi":   "for your information",
+    "smh":   "shaking my head",
+    "nvm":   "never mind",
+    "ty":    "thank you",
+    "thx":   "thanks",
+    "np":    "no problem",
+    "omw":   "on my way",
+    "ttyl":  "talk to you later",
+    "wb":    "welcome back",
+    "fr":    "for real",
+    "no cap": "no lie",
+    "cap":   "lie",
+    "rip":   "rest in peace",
+    "mid":   "mediocre",
+    "sus":   "suspicious",
+    "dm":    "direct message",
+    "gg":    "good game",
+    "gl":    "good luck",
+    "hf":    "have fun",
+    "gn":    "good night",
+    "gm":    "good morning",
+    "nt":    "nice try",
+    "wp":    "well played",
+    "ez":    "easy",
+    "w":     "win",
+    "l":     "loss",
+}
+
+# Pre-build a single regex that matches any abbreviation as a whole word
+_ABBREV_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_ABBREVIATIONS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+def expand_abbreviations(text: str) -> str:
+    """Replace known chat abbreviations with their full spoken form."""
+    def _replace(m: re.Match) -> str:
+        return _ABBREVIATIONS[m.group(0).lower()]
+    return _ABBREV_PATTERN.sub(_replace, text)
+
+
+def apply_blocklist(text: str, blocklist: list[str]) -> str:
+    """Replace each blocked word/phrase with '[bleep]' (case-insensitive)."""
+    if not blocklist:
+        return text
+    for word in blocklist:
+        text = re.sub(re.escape(word), "[bleep]", text, flags=re.IGNORECASE)
+    return text
 
 
 # ─── Translation helper ────────────────────────────────────────────────────────
@@ -304,6 +385,14 @@ guild_joining:      set[int]                   = set()  # debounce concurrent jo
 guild_moving:       set[int]                   = set()  # currently moving channels (follow)
 user_last_spoke:    dict[tuple, float]         = {}  # (guild_id, user_id) -> monotonic
 user_last_content:  dict[tuple, str]           = {}  # (guild_id, user_id) -> last msg text
+guild_intentional_leave: set[int]             = set()  # guilds where /leave was used (no auto-rejoin)
+guild_auto_rejoin_channel: dict[int, int]     = {}  # guild_id -> channel_id to rejoin if unexpectedly disconnected
+
+# ─── Session stats ────────────────────────────────────────────────────────────
+_bot_start_time                               = time.monotonic()
+guild_messages_read: dict[int, int]           = {}  # per-guild total messages spoken
+_cache_hits                                   = 0
+_cache_misses                                 = 0
 
 
 def get_queue(guild_id: int) -> GuildQueue:
@@ -362,9 +451,14 @@ def default_settings() -> dict:
         # TTS engine
         "tts_engine":           "edge",          # "edge" (neural) or "gtts"
         "edge_voice":           DEFAULT_EDGE_VOICE,
+        "speech_rate":          "+0%",           # Edge TTS rate: -50% to +50%
         # Translation
         "auto_translate":       False,
         "translate_target":     "en",
+        # Word blocklist
+        "word_blocklist":       [],              # words/phrases that censor to "[bleep]"
+        # Auto-rejoin on unexpected disconnect
+        "auto_rejoin":          True,
     }
 
 
@@ -419,14 +513,15 @@ def clean_message(text: str) -> Optional[str]:
     if not text:
         return None
     text = text.strip()
-    text = re.sub(r"https?://\S+", "", text)           # remove links
-    text = re.sub(r"www\.\S+", "", text)
+    text = re.sub(r"https?://\S+", "link", text)       # replace URLs with "link"
+    text = re.sub(r"www\.\S+", "link", text)
     text = re.sub(r"<@!?\d+>", "someone", text)        # @mentions
     text = re.sub(r"<#\d+>", "a channel", text)
     text = re.sub(r"<@&\d+>", "a role", text)
     text = re.sub(r"<a?:\w+:\d+>", "", text)           # custom emoji markup
     text = re.sub(r"(.)\1{3,}", r"\1\1", text)         # heyyyy → hey
     text = re.sub(r"([!?.,-]){3,}", r"\1", text)       # !!! → !
+    text = expand_abbreviations(text)                   # lol → laughing out loud, etc.
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
 
@@ -595,7 +690,8 @@ async def tts_worker(guild: discord.Guild):
                         elif engine == "edge":
                             # Edge TTS — natural neural voices, async native
                             try:
-                                communicate = edge_tts.Communicate(cleaned, edge_voice)
+                                speech_rate = s.get("speech_rate", "+0%")
+                                communicate = edge_tts.Communicate(cleaned, edge_voice, rate=speech_rate)
                                 await communicate.save(str(mp3))
                                 cache_put(cleaned, f"{item.lang}_{cache_key_extra}", item.slow, mp3.read_bytes())
                             except Exception as edge_err:
@@ -630,6 +726,7 @@ async def tts_worker(guild: discord.Guild):
 
                     print(f"[Playback] Finished in {guild.name}")
                     touch_activity(guild.id)
+                    guild_messages_read[guild.id] = guild_messages_read.get(guild.id, 0) + 1
                     success = True
                     break
 
@@ -914,6 +1011,11 @@ async def on_message(message: discord.Message):
                 # Use the target language for TTS so the voice matches
                 lang = target
 
+            # Apply word blocklist (censor blocked words to "[bleep]")
+            blocklist = s.get("word_blocklist", [])
+            if blocklist:
+                full_text = apply_blocklist(full_text, blocklist)
+
             # Host priority
             host_id   = s.get("host_id")
             host_mode = s.get("host_mode", False)
@@ -934,13 +1036,42 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+async def _auto_rejoin(guild: discord.Guild, channel_id: int):
+    """Wait 3s then silently rejoin the channel if the bot was unexpectedly disconnected."""
+    await asyncio.sleep(3)
+    vc = guild.voice_client
+    if vc and vc.is_connected():
+        return  # already reconnected somehow
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return
+    try:
+        await channel.connect(timeout=10.0, reconnect=True)
+        print(f"[AutoRejoin] Rejoined {channel.name} in {guild.name}")
+        touch_activity(guild.id)
+    except Exception as e:
+        print(f"[AutoRejoin] Failed to rejoin {guild.name}: {e}")
+
+
 @bot.event
 async def on_voice_state_update(
     member: discord.Member,
     before: discord.VoiceState,
     after:  discord.VoiceState,
 ):
-    if member.bot:
+    # ── Detect unexpected bot disconnect and auto-rejoin ──────────────────────
+    if member.bot and member.id == bot.user.id:
+        if before.channel is not None and after.channel is None:
+            gid = member.guild.id
+            if gid in guild_intentional_leave:
+                guild_intentional_leave.discard(gid)
+                return  # intentional /leave — don't rejoin
+            s = get_guild_settings(gid)
+            if s.get("auto_rejoin", True) and gid in guild_auto_rejoin_channel:
+                asyncio.create_task(_auto_rejoin(member.guild, guild_auto_rejoin_channel[gid]))
+        elif after.channel is not None:
+            # Track which channel the bot is currently in for auto-rejoin
+            guild_auto_rejoin_channel[member.guild.id] = after.channel.id
         return
 
     guild = member.guild
@@ -1001,6 +1132,8 @@ async def cmd_leave(interaction: discord.Interaction):
     if not vc or not vc.is_connected():
         await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
         return
+    guild_intentional_leave.add(interaction.guild.id)  # suppress auto-rejoin
+    guild_auto_rejoin_channel.pop(interaction.guild.id, None)
     await vc.disconnect()
     guild_last_activity.pop(interaction.guild.id, None)
     print(f"[Voice] Manually left {interaction.guild.name}")
@@ -1598,9 +1731,170 @@ async def cmd_status(interaction: discord.Interaction):
     embed.add_field(name="🔒 Filters", value=(
         f"**Smart filter:** {oo(s['smart_filter'])}\n"
         f"**Required role:** {rl(s.get('required_role_id'))}\n"
-        f"**Ignored:** {ignored}"
+        f"**Ignored:** {ignored}\n"
+        f"**Blocklist words:** {len(s.get('word_blocklist', []))}"
     ), inline=True)
 
+    blocklist_words = s.get("word_blocklist", [])
+    speech_rate     = s.get("speech_rate", "+0%")
+    auto_rejoin_on  = s.get("auto_rejoin", True)
+
+    embed.add_field(name="🆕 New Features", value=(
+        f"**Speech rate:** `{speech_rate}`\n"
+        f"**Auto-rejoin:** {oo(auto_rejoin_on)}\n"
+        f"**Blocklist:** {', '.join(f'`{w}`' for w in blocklist_words) or 'None'}"
+    ), inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── Say / Announce ────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="say", description="Read a message aloud immediately at top priority")
+async def cmd_say(interaction: discord.Interaction, text: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    blocklist = s.get("word_blocklist", [])
+    clean_text = apply_blocklist(text, blocklist) if blocklist else text
+    await interaction.response.send_message(f"🔊 *{text}*", ephemeral=True)
+    await enqueue(
+        interaction.guild, clean_text,
+        lang=s.get("language", "en"),
+        slow=s.get("slow_tts", False),
+        max_length=1000,
+        priority=0,
+        interrupt=False,
+    )
+
+
+@bot.tree.command(name="announce", description="Clear the queue and read an urgent announcement immediately")
+async def cmd_announce(interaction: discord.Interaction, text: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    # Clear queue and stop current audio
+    get_queue(interaction.guild.id).clear()
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+    blocklist = s.get("word_blocklist", [])
+    full_text  = f"Announcement. {text}"
+    clean_text = apply_blocklist(full_text, blocklist) if blocklist else full_text
+    await interaction.response.send_message(f"📢 **Announcement:** {text}")
+    await enqueue(
+        interaction.guild, clean_text,
+        lang=s.get("language", "en"),
+        slow=s.get("slow_tts", False),
+        max_length=1000,
+        priority=0,
+        interrupt=True,
+    )
+
+
+# ── Speech speed ──────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setspeed", description="Set the Edge TTS speech rate (Normal = default)")
+@app_commands.choices(rate=SPEED_CHOICES)
+async def cmd_setspeed(interaction: discord.Interaction, rate: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["speech_rate"] = rate
+    save_settings()
+    _tts_cache.clear()
+    label = next((c.name for c in SPEED_CHOICES if c.value == rate), rate)
+    await interaction.response.send_message(f"Speech rate set to **{label}**. (Edge TTS only)")
+
+
+# ── Word blocklist ─────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="addblock", description="Add a word or phrase to the censor list (replaced with '[bleep]')")
+async def cmd_addblock(interaction: discord.Interaction, word: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    bl = s.setdefault("word_blocklist", [])
+    entry = word.strip().lower()
+    if entry not in bl:
+        bl.append(entry)
+        save_settings()
+        await interaction.response.send_message(f"Added `{entry}` to the blocklist.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"`{entry}` is already blocked.", ephemeral=True)
+
+
+@bot.tree.command(name="removeblock", description="Remove a word or phrase from the censor list")
+async def cmd_removeblock(interaction: discord.Interaction, word: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    bl = s.get("word_blocklist", [])
+    entry = word.strip().lower()
+    if entry in bl:
+        bl.remove(entry)
+        save_settings()
+        await interaction.response.send_message(f"Removed `{entry}` from the blocklist.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"`{entry}` was not in the blocklist.", ephemeral=True)
+
+
+@bot.tree.command(name="blocklist", description="Show the current word/phrase censor list")
+async def cmd_blocklist(interaction: discord.Interaction):
+    s  = get_guild_settings(interaction.guild.id)
+    bl = s.get("word_blocklist", [])
+    if not bl:
+        await interaction.response.send_message("The blocklist is empty.", ephemeral=True)
+    else:
+        words = ", ".join(f"`{w}`" for w in bl)
+        await interaction.response.send_message(f"**Blocked words/phrases:** {words}", ephemeral=True)
+
+
+# ── Auto-rejoin toggle ────────────────────────────────────────────────────────
+
+@bot.tree.command(name="autorejoinin", description="Toggle auto-rejoin when bot is unexpectedly disconnected from VC")
+async def cmd_autorejoinin(interaction: discord.Interaction, enabled: bool):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["auto_rejoin"] = enabled
+    save_settings()
+    await interaction.response.send_message(
+        f"Auto-rejoin on unexpected disconnect: **{'ON' if enabled else 'OFF'}**."
+    )
+
+
+# ── Stats ─────────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="stats", description="Show bot stats for this session")
+async def cmd_stats(interaction: discord.Interaction):
+    gid      = interaction.guild.id
+    uptime_s = int(time.monotonic() - _bot_start_time)
+    h, rem   = divmod(uptime_s, 3600)
+    m, sec   = divmod(rem, 60)
+    uptime   = f"{h}h {m}m {sec}s"
+
+    total_reads  = guild_messages_read.get(gid, 0)
+    total_hits   = _cache_hits
+    total_misses = _cache_misses
+    total_req    = total_hits + total_misses
+    hit_rate     = f"{total_hits / total_req * 100:.1f}%" if total_req > 0 else "N/A"
+    cache_size   = len(_tts_cache)
+    q_size       = get_queue(gid).size()
+
+    embed = discord.Embed(title="📈 TTS Bot — Session Stats", color=discord.Color.green())
+    embed.add_field(name="⏱️ Uptime",            value=uptime,             inline=True)
+    embed.add_field(name="🔊 Messages read",      value=str(total_reads),   inline=True)
+    embed.add_field(name="📋 Queue now",          value=str(q_size),        inline=True)
+    embed.add_field(name="💾 Cache entries",      value=f"{cache_size}/50", inline=True)
+    embed.add_field(name="✅ Cache hit rate",     value=hit_rate,           inline=True)
+    embed.add_field(name="🔁 Total TTS requests", value=str(total_req),     inline=True)
+    embed.set_footer(text="Stats reset when the bot restarts.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1621,6 +1915,8 @@ async def cmd_panel(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name="🔊 Voice & Queue", value=(
         "`/join` / `/leave`\n"
+        "`/say <text>` — Read text immediately at priority\n"
+        "`/announce <text>` — Clear queue & make announcement\n"
         "`/skip` — Skip current message\n"
         "`/pause` / `/resume`\n"
         "`/queue` — Queue size\n"
@@ -1631,20 +1927,26 @@ async def cmd_panel(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name="🗣️ TTS", value=(
         "`/tts_on` / `/tts_off`\n"
-        "`/setlang <code>` — Server language\n"
-        "`/setmylang <code>` / `/clearmylang`\n"
+        "`/setlang` — Server language (dropdown)\n"
+        "`/setmylang` / `/clearmylang` — Personal language\n"
         "`/setmaxlength <n>`\n"
         "`/setcooldown <s>`\n"
         "`/speed_slow` / `/speed_normal`"
     ), inline=False)
     embed.add_field(name="🎙️ Voice Engine", value=(
-        "`/ttsengine edge|gtts` — Switch engine\n"
-        "`/setvoice <name>` — Set neural voice\n"
-        "`/voicelist` — See available voices"
+        "`/ttsengine` — Switch engine (dropdown)\n"
+        "`/setvoice` — Set neural voice (dropdown)\n"
+        "`/setspeed` — Speech rate -50% to +50% (dropdown)\n"
+        "`/voicelist` — See all voices"
     ), inline=False)
     embed.add_field(name="🌐 Translation", value=(
         "`/translate on|off` — Auto-translate messages\n"
-        "`/settranslatetarget <lang>` — Language to translate to"
+        "`/settranslatetarget` — Language to translate to (dropdown)"
+    ), inline=False)
+    embed.add_field(name="🔒 Word Blocklist", value=(
+        "`/addblock <word>` — Censor a word/phrase\n"
+        "`/removeblock <word>` — Remove from censor list\n"
+        "`/blocklist` — View blocked words"
     ), inline=False)
     embed.add_field(name="👤 Name & Users", value=(
         "`/sayname_on` / `/sayname_off`\n"
@@ -1661,6 +1963,8 @@ async def cmd_panel(interaction: discord.Interaction):
     embed.add_field(name="⚙️ Filters & Info", value=(
         "`/samevc_on` / `/samevc_off`\n"
         "`/smartfilter_on` / `/smartfilter_off`\n"
+        "`/autorejoinin on|off` — Auto-rejoin on disconnect\n"
+        "`/stats` — Session stats\n"
         "`/tts_status` — Live status & all settings"
     ), inline=False)
     embed.set_footer(text="Settings persist after restarts. Bot auto-leaves when VC is empty.")
