@@ -796,6 +796,11 @@ async def tts_worker(guild: discord.Guild):
             if not vc or not vc.is_connected():
                 continue
 
+            # Always fetch fresh settings at the top of each item — this also
+            # fixes the UnboundLocalError caused by using 's' before its assignment.
+            s      = get_guild_settings(guild.id)
+            engine = s.get("tts_engine", "edge")
+
             # Silence / night-mode check — skip item silently
             if _is_silence_time(s):
                 print(f"[Worker] Silence mode active — skipping in {guild.name}")
@@ -808,10 +813,6 @@ async def tts_worker(guild: discord.Guild):
             cleaned = smart_truncate(cleaned, item.max_length)
 
             print(f"[Playback] Starting in {guild.name}: {cleaned[:60]}...")
-
-            # Determine which TTS engine and voice to use for this guild
-            s          = get_guild_settings(guild.id)
-            engine     = s.get("tts_engine", "edge")
             guild_lang = s.get("language", "en")
 
             # If this item's language matches the guild default, use the configured voice.
