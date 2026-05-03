@@ -9,6 +9,7 @@ Architecture:
 - Host priority, follow mode, pause/resume, smart filter
 """
 
+import io
 import os
 import re
 import bisect
@@ -477,6 +478,7 @@ user_last_content:  dict[tuple, str]           = {}  # (guild_id, user_id) -> la
 guild_intentional_leave: set[int]             = set()  # guilds where /leave was used (no auto-rejoin)
 guild_auto_rejoin_channel: dict[int, int]     = {}  # guild_id -> channel_id to rejoin if unexpectedly disconnected
 guild_last_spoken: dict[int, str]             = {}  # guild_id -> last text spoken (for /repeat)
+guild_tts_history: dict[int, list[str]]      = {}  # guild_id -> last 10 spoken messages
 user_message_times: dict[tuple, list[float]] = {}  # (guild_id, user_id) -> list of monotonic timestamps
 
 # ─── Session stats ────────────────────────────────────────────────────────────
@@ -566,6 +568,14 @@ def default_settings() -> dict:
         # Silence/night mode (HH:MM strings or None)
         "silence_start":        None,
         "silence_end":          None,
+        # Per-user voice overrides {str(user_id): edge_voice_name}
+        "user_voices":          {},
+        # Max messages one user can have in queue at once (0 = unlimited)
+        "max_queue_per_user":   0,
+        # Welcome message spoken when bot joins a VC (None = off)
+        "welcome_text":         None,
+        # React ✅ to messages that get queued
+        "message_reactions":    False,
     }
 
 
@@ -804,9 +814,10 @@ async def tts_worker(guild: discord.Guild):
             guild_lang = s.get("language", "en")
 
             # If this item's language matches the guild default, use the configured voice.
-            # If it's a per-user language override, pick the matching neural voice.
+            # Per-user voice override takes precedence; inline lang override falls back to neural.
             if item.lang == guild_lang:
-                edge_voice = s.get("edge_voice", DEFAULT_EDGE_VOICE)
+                user_voice_override = s.get("user_voices", {}).get(str(item.user_id)) if item.user_id else None
+                edge_voice = user_voice_override or s.get("edge_voice", DEFAULT_EDGE_VOICE)
             else:
                 edge_voice = lang_to_edge_voice(item.lang)
 
@@ -866,6 +877,10 @@ async def tts_worker(guild: discord.Guild):
                     print(f"[Playback] Finished in {guild.name}")
                     touch_activity(guild.id)
                     guild_last_spoken[guild.id] = cleaned
+                    hist = guild_tts_history.setdefault(guild.id, [])
+                    hist.append(cleaned)
+                    if len(hist) > 10:
+                        hist.pop(0)
                     guild_messages_read[guild.id] = guild_messages_read.get(guild.id, 0) + 1
 
                     # Post to log channel if configured
@@ -1204,6 +1219,15 @@ async def on_message(message: discord.Message):
             priority  = 0 if is_host else 1
             interrupt = is_host and s.get("host_interrupts", False)
 
+            # Max-queue-per-user cap (0 = unlimited)
+            max_q = s.get("max_queue_per_user", 0)
+            if max_q > 0:
+                q = get_queue(message.guild.id)
+                user_count = sum(1 for it in q._items if it.user_id == message.author.id)
+                if user_count >= max_q:
+                    await bot.process_commands(message)
+                    return
+
             await enqueue(
                 message.guild,
                 full_text,
@@ -1214,6 +1238,13 @@ async def on_message(message: discord.Message):
                 interrupt=interrupt,
                 user_id=message.author.id,
             )
+
+            # ✅ reaction feedback
+            if s.get("message_reactions", False):
+                try:
+                    await message.add_reaction("✅")
+                except Exception:
+                    pass
 
     await bot.process_commands(message)
 
@@ -1254,6 +1285,15 @@ async def on_voice_state_update(
         elif after.channel is not None:
             # Track which channel the bot is currently in for auto-rejoin
             guild_auto_rejoin_channel[member.guild.id] = after.channel.id
+            # Speak welcome message when bot joins a VC
+            s2 = get_guild_settings(member.guild.id)
+            welcome = s2.get("welcome_text")
+            if welcome:
+                asyncio.create_task(enqueue(
+                    member.guild, welcome,
+                    lang=s2.get("language", "en"), slow=False,
+                    max_length=300, priority=0,
+                ))
         return
 
     guild = member.guild
@@ -1952,16 +1992,21 @@ async def cmd_status(interaction: discord.Interaction):
     sil_end         = s.get("silence_end")   or "off"
     silence_val     = f"`{sil_start}` → `{sil_end}`" if sil_start != "off" else "off"
 
+    max_q          = s.get("max_queue_per_user", 0)
+    welcome_text   = s.get("welcome_text") or "none"
+    reactions_on   = s.get("message_reactions", False)
+    uvoice_count   = len(s.get("user_voices", {}))
+
     embed.add_field(name="🆕 Extra Features", value=(
-        f"**Speech rate:** `{speech_rate}`\n"
-        f"**Volume:** `{volume_pct}%`\n"
-        f"**Auto-rejoin:** {oo(auto_rejoin_on)}\n"
-        f"**Saved phrases:** `{phrase_count}`\n"
-        f"**Pronounce overrides:** `{pronounce_count}`\n"
+        f"**Speech rate:** `{speech_rate}`  **Volume:** `{volume_pct}%`\n"
+        f"**Auto-rejoin:** {oo(auto_rejoin_on)}  **Reactions:** {oo(reactions_on)}\n"
+        f"**Saved phrases:** `{phrase_count}`  **Pronounce:** `{pronounce_count}`\n"
+        f"**User voices:** `{uvoice_count}`  **Max queue/user:** `{'off' if max_q == 0 else max_q}`\n"
         f"**VC announce:** {oo(vc_announce_on)}\n"
         f"**Rate limit:** {'off' if rate_limit == 0 else f'{rate_limit} msgs / {rate_window}s'}\n"
         f"**Log channel:** {log_ch.mention if log_ch else 'none'}\n"
         f"**Silence window:** {silence_val}\n"
+        f"**Welcome msg:** *{welcome_text[:60]}{'…' if len(welcome_text) > 60 else ''}*\n"
         f"**Blocklist:** {', '.join(f'`{w}`' for w in blocklist_words) or 'None'}"
     ), inline=False)
 
@@ -2480,6 +2525,244 @@ async def cmd_queuepos(interaction: discord.Interaction):
         )
 
 
+# ── Per-user voice ─────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setuservoice", description="Assign a specific neural voice to a user")
+@app_commands.describe(user="The user to assign a voice to", voice="Edge TTS neural voice name")
+async def cmd_setuservoice(interaction: discord.Interaction, user: discord.Member, voice: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    voices = s.setdefault("user_voices", {})
+    voices[str(user.id)] = voice.strip()
+    save_settings()
+    await interaction.response.send_message(
+        f"Voice for **{user.display_name}** set to `{voice.strip()}`.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="clearuservoice", description="Remove a user's assigned voice (use server default)")
+async def cmd_clearuservoice(interaction: discord.Interaction, user: discord.Member):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s      = get_guild_settings(interaction.guild.id)
+    voices = s.get("user_voices", {})
+    uid    = str(user.id)
+    if uid not in voices:
+        await interaction.response.send_message(f"**{user.display_name}** has no assigned voice.", ephemeral=True); return
+    del voices[uid]; save_settings()
+    await interaction.response.send_message(f"Cleared voice for **{user.display_name}**.", ephemeral=True)
+
+
+# ── TTS history ────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="history", description="Show the last 10 messages that were spoken")
+async def cmd_history(interaction: discord.Interaction):
+    hist = guild_tts_history.get(interaction.guild.id, [])
+    if not hist:
+        await interaction.response.send_message("Nothing has been spoken yet this session.", ephemeral=True); return
+    lines = "\n".join(f"`{i+1}.` {h[:120]}{'…' if len(h) > 120 else ''}" for i, h in enumerate(reversed(hist)))
+    embed  = discord.Embed(title="🕘 TTS History (last 10)", description=lines, color=discord.Color.blurple())
+    embed.set_footer(text="Most recent first. Resets on bot restart.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── Max queue per user ────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setmaxqueue", description="Limit how many messages one user can have queued at once (0 = off)")
+async def cmd_setmaxqueue(interaction: discord.Interaction, limit: int):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    if limit < 0:
+        await interaction.response.send_message("Limit must be 0 or higher.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["max_queue_per_user"] = limit; save_settings()
+    if limit == 0:
+        await interaction.response.send_message("Per-user queue cap **disabled**.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"Each user can now have at most **{limit}** message(s) in the queue at once.", ephemeral=True
+        )
+
+
+# ── Settings export / import ──────────────────────────────────────────────────
+
+@bot.tree.command(name="settingsexport", description="Download this server's bot settings as a JSON file")
+async def cmd_settingsexport(interaction: discord.Interaction):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s    = get_guild_settings(interaction.guild.id)
+    data = json.dumps(s, indent=2, default=str)
+    buf  = io.BytesIO(data.encode())
+    buf.seek(0)
+    fname = f"ttsbot_settings_{interaction.guild.id}.json"
+    await interaction.response.send_message(
+        "Here are your current settings:", file=discord.File(buf, filename=fname), ephemeral=True
+    )
+
+
+@bot.tree.command(name="settingsimport", description="Restore settings from a previously exported JSON file")
+async def cmd_settingsimport(interaction: discord.Interaction, file: discord.Attachment):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    if not file.filename.endswith(".json"):
+        await interaction.response.send_message("Please attach a `.json` file.", ephemeral=True); return
+    try:
+        raw  = await file.read()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Top-level value must be a JSON object.")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to parse file: {e}", ephemeral=True); return
+    # Merge imported settings over defaults — don't let bad keys crash the bot
+    defaults = default_settings()
+    merged   = {k: data.get(k, v) for k, v in defaults.items()}
+    guild_settings[interaction.guild.id] = merged
+    save_settings()
+    await interaction.response.send_message(
+        "✅ Settings imported successfully. All values have been applied.", ephemeral=True
+    )
+
+
+# ── Welcome message ────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setwelcome", description="Speak a message every time the bot joins a voice channel")
+async def cmd_setwelcome(interaction: discord.Interaction, text: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["welcome_text"] = text.strip(); save_settings()
+    await interaction.response.send_message(
+        f"Welcome message set: *{text.strip()}*", ephemeral=True
+    )
+
+
+@bot.tree.command(name="clearwelcome", description="Remove the welcome message spoken on bot join")
+async def cmd_clearwelcome(interaction: discord.Interaction):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["welcome_text"] = None; save_settings()
+    await interaction.response.send_message("Welcome message cleared.", ephemeral=True)
+
+
+# ── Reactions toggle ───────────────────────────────────────────────────────────
+
+@bot.tree.command(name="reactions", description="Toggle ✅ reaction on messages the bot reads aloud")
+@app_commands.choices(enabled=[
+    app_commands.Choice(name="on",  value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def cmd_reactions(interaction: discord.Interaction, enabled: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["message_reactions"] = (enabled == "on"); save_settings()
+    state = "enabled" if s["message_reactions"] else "disabled"
+    await interaction.response.send_message(f"Message reactions **{state}**.", ephemeral=True)
+
+
+# ── Per-command help ───────────────────────────────────────────────────────────
+
+_COMMAND_HELP: dict[str, str] = {
+    "join":             "Join your current voice channel.\nUsage: `/join`",
+    "leave":            "Leave the voice channel.\nUsage: `/leave`",
+    "say":              "Read a message aloud immediately at the highest priority, bypassing the queue.\nUsage: `/say <text>`",
+    "announce":         "Clear the entire queue then read an urgent announcement at top priority.\nUsage: `/announce <text>`",
+    "countdown":        "Count down from N to 1 then say 'Go!' out loud. Great for race starts.\nUsage: `/countdown <2–10>`",
+    "repeat":           "Re-read the last message that was spoken.\nUsage: `/repeat`",
+    "schedule":         "Queue a message to be read after a delay (5–600 seconds).\nUsage: `/schedule <seconds> <text>`",
+    "skip":             "Skip the message currently being spoken.\nUsage: `/skip`",
+    "skipnext":         "Skip the next N queued messages at once (1–20).\nUsage: `/skipnext <count>`",
+    "pause":            "Pause TTS playback. Messages keep queuing.\nUsage: `/pause`",
+    "resume":           "Resume paused TTS playback.\nUsage: `/resume`",
+    "queue":            "Show how many messages are in the queue.\nUsage: `/queue`",
+    "queueview":        "Preview the next few messages waiting in the queue.\nUsage: `/queueview`",
+    "queuepos":         "See your position in the TTS queue.\nUsage: `/queuepos`",
+    "clearqueue":       "Remove all queued messages instantly.\nUsage: `/clearqueue`",
+    "removefromqueue":  "Remove a specific message by position number.\nUsage: `/removefromqueue <position>`",
+    "clearuserqueue":   "Remove all queued messages from a specific user.\nUsage: `/clearuserqueue @user`",
+    "phraseadd":        "Save a shortcut phrase by name. Play it with /phraseplay.\nUsage: `/phraseadd <name> <text>`",
+    "phraseplay":       "Read a saved phrase aloud at top priority.\nUsage: `/phraseplay <name>`",
+    "phraselist":       "Show all saved shortcut phrases.\nUsage: `/phraselist`",
+    "phraseremove":     "Delete a saved shortcut phrase.\nUsage: `/phraseremove <name>`",
+    "tts_on":           "Enable TTS reading for this server.\nUsage: `/tts_on`",
+    "tts_off":          "Disable TTS reading for this server.\nUsage: `/tts_off`",
+    "setlang":          "Set the server's TTS language (dropdown menu).\nUsage: `/setlang`",
+    "setmylang":        "Set your personal TTS language (overrides server language).\nUsage: `/setmylang`",
+    "clearmylang":      "Remove your personal language override.\nUsage: `/clearmylang`",
+    "setmaxlength":     "Set the maximum characters per message before truncation.\nUsage: `/setmaxlength <1–1000>`",
+    "setcooldown":      "Minimum seconds between reads from the same user.\nUsage: `/setcooldown <seconds>`",
+    "speed_slow":       "Enable slow TTS mode (gTTS only).\nUsage: `/speed_slow`",
+    "speed_normal":     "Disable slow TTS mode.\nUsage: `/speed_normal`",
+    "ttsengine":        "Switch between Edge TTS (neural) and gTTS (dropdown).\nUsage: `/ttsengine`",
+    "setvoice":         "Choose a neural voice for Edge TTS (dropdown).\nUsage: `/setvoice`",
+    "setuservoice":     "Assign a specific neural voice to one user so they sound distinct.\nUsage: `/setuservoice @user <voice_name>`\nTip: use /voicelist to see voice names.",
+    "clearuservoice":   "Remove a user's assigned voice so they use the server default.\nUsage: `/clearuservoice @user`",
+    "setspeed":         "Set Edge TTS speech rate from -50% (slow) to +50% (fast).\nUsage: `/setspeed`",
+    "volume":           "Set output volume 1–200 (100 = normal, 200 = double).\nUsage: `/volume <level>`",
+    "voicelist":        "List all available neural voices.\nUsage: `/voicelist`",
+    "pronounce":        "Add, remove, or list custom pronunciation overrides.\nUsage: `/pronounce add BMW 'Bee Em Double-you'`",
+    "translate":        "Enable/disable automatic message translation before TTS.\nUsage: `/translate on|off`",
+    "settranslatetarget": "Set the language to translate messages into (dropdown).\nUsage: `/settranslatetarget`",
+    "addblock":         "Add a word or phrase to the censor list — replaced with [bleep].\nUsage: `/addblock <word>`",
+    "removeblock":      "Remove a word from the censor list.\nUsage: `/removeblock <word>`",
+    "blocklist":        "Show all currently blocked words/phrases.\nUsage: `/blocklist`",
+    "setuserrate":      "Limit messages per user. e.g. max 3 per 10 seconds.\nUsage: `/setuserrate <messages> <seconds>` (0 = unlimited)",
+    "setmaxqueue":      "Cap how many messages one user can have queued at once.\nUsage: `/setmaxqueue <limit>` (0 = unlimited)",
+    "samevc_on":        "Only read messages from users in the same VC as the bot.\nUsage: `/samevc_on`",
+    "samevc_off":       "Read messages from users regardless of which VC they're in.\nUsage: `/samevc_off`",
+    "smartfilter_on":   "Skip duplicate messages from the same user in a row.\nUsage: `/smartfilter_on`",
+    "smartfilter_off":  "Disable smart duplicate filter.\nUsage: `/smartfilter_off`",
+    "ignore":           "Ignore all messages from a user.\nUsage: `/ignore @user`",
+    "unignore":         "Re-enable reading messages from a user.\nUsage: `/unignore @user`",
+    "vcannounce":       "Speak who joins/leaves the voice channel automatically.\nUsage: `/vcannounce on|off`",
+    "setlogchannel":    "Post every spoken message to a text channel (silent, timestamped).\nUsage: `/setlogchannel #channel`",
+    "clearlogchannel":  "Stop logging spoken messages.\nUsage: `/clearlogchannel`",
+    "silence":          "Mute TTS between two times — great for overnight events.\nUsage: `/silence 23:00 07:00`",
+    "clearsilence":     "Disable silence/night mode.\nUsage: `/clearsilence`",
+    "setwelcome":       "Speak a message every time the bot joins a VC.\nUsage: `/setwelcome <text>`",
+    "clearwelcome":     "Remove the welcome message.\nUsage: `/clearwelcome`",
+    "reactions":        "Toggle ✅ emoji reaction on messages the bot queues.\nUsage: `/reactions on|off`",
+    "sayname_on":       "Announce the username before each message.\nUsage: `/sayname_on`",
+    "sayname_off":      "Stop announcing usernames.\nUsage: `/sayname_off`",
+    "nick_on":          "Use Discord nicknames instead of account names.\nUsage: `/nick_on`",
+    "nick_off":         "Use account names instead of nicknames.\nUsage: `/nick_off`",
+    "setvoiceprefix":   "Change the word between name and message (default: 'says').\nUsage: `/setvoiceprefix <word>`",
+    "sethost":          "Designate a host user whose messages get priority.\nUsage: `/sethost @user`",
+    "clearhost":        "Remove the current host designation.\nUsage: `/clearhost`",
+    "hostmode":         "Enable/disable host priority mode.\nUsage: `/hostmode on|off`",
+    "hostinterrupt":    "Allow the host's messages to interrupt currently playing TTS.\nUsage: `/hostinterrupt on|off`",
+    "followmode":       "Bot follows the host to whichever VC they join.\nUsage: `/followmode on|off`",
+    "history":          "Show the last 10 messages that were spoken this session.\nUsage: `/history`",
+    "settingsexport":   "Download all bot settings for this server as a JSON file.\nUsage: `/settingsexport`",
+    "settingsimport":   "Restore settings from a previously exported JSON file.\nUsage: `/settingsimport` (attach the .json file)",
+    "tts_status":       "Show all current settings and live bot state.\nUsage: `/tts_status`",
+    "stats":            "Show session stats (uptime, messages read, cache hit rate).\nUsage: `/stats`",
+    "ping":             "Check the bot's latency to Discord.\nUsage: `/ping`",
+    "countdown":        "Count down from N out loud then say Go!\nUsage: `/countdown <2–10>`",
+    "autorejoinin":     "Automatically rejoin voice when unexpectedly disconnected.\nUsage: `/autorejoinin on|off`",
+    "testtts":          "Test TTS audio is working. Optionally supply custom text.\nUsage: `/testtts [text]`",
+    "panel":            "Show the full command panel.\nUsage: `/panel`",
+    "ttshelp":          "Get detailed help for any specific command.\nUsage: `/ttshelp <command_name>`",
+}
+
+
+@bot.tree.command(name="ttshelp", description="Get detailed help for any specific command")
+@app_commands.describe(command="The command name to get help for (without the /)")
+async def cmd_ttshelp(interaction: discord.Interaction, command: str):
+    key  = command.strip().lstrip("/").lower()
+    info = _COMMAND_HELP.get(key)
+    if info is None:
+        close = [k for k in _COMMAND_HELP if key in k]
+        hint  = f"\n\nDid you mean: {', '.join(f'`/{c}`' for c in close[:5])}" if close else ""
+        await interaction.response.send_message(
+            f"No help found for `/{key}`.{hint}\n\nUse `/panel` to browse all commands.", ephemeral=True
+        ); return
+    embed = discord.Embed(title=f"/{key}", description=info, color=discord.Color.blurple())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="panel", description="Show all TTS bot commands")
 async def cmd_panel(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -2523,6 +2806,8 @@ async def cmd_panel(interaction: discord.Interaction):
     embed.add_field(name="🎙️ Voice Engine", value=(
         "`/ttsengine` — Switch engine (dropdown)\n"
         "`/setvoice` — Neural voice (dropdown)\n"
+        "`/setuservoice @user <voice>` — Per-user voice\n"
+        "`/clearuservoice @user` — Remove per-user voice\n"
         "`/setspeed` — Speech rate (dropdown)\n"
         "`/volume <1–200>` — Output volume\n"
         "`/voicelist` — See all voices\n"
@@ -2541,10 +2826,18 @@ async def cmd_panel(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name="📢 Announcements & Logging", value=(
         "`/vcannounce on|off` — Announce joins/leaves\n"
-        "`/setlogchannel #ch` — Log spoken messages\n"
-        "`/clearlogchannel` — Stop logging\n"
-        "`/silence HH:MM HH:MM` — Night/silence mode\n"
-        "`/clearsilence` — Disable silence mode"
+        "`/setwelcome <text>` / `/clearwelcome` — Join message\n"
+        "`/reactions on|off` — ✅ react to queued messages\n"
+        "`/setlogchannel #ch` / `/clearlogchannel`\n"
+        "`/silence HH:MM HH:MM` / `/clearsilence` — Night mode"
+    ), inline=False)
+    embed.add_field(name="🔒 Filters & Limits", value=(
+        "`/addblock <word>` / `/removeblock <word>` / `/blocklist`\n"
+        "`/setuserrate <msgs> <secs>` — Per-user rate limit\n"
+        "`/setmaxqueue <n>` — Max queued msgs per user\n"
+        "`/samevc_on` / `/samevc_off`\n"
+        "`/smartfilter_on` / `/smartfilter_off`\n"
+        "`/ignore @user` / `/unignore @user`"
     ), inline=False)
     embed.add_field(name="👤 Name & Host", value=(
         "`/sayname_on` / `/sayname_off`\n"
@@ -2556,11 +2849,13 @@ async def cmd_panel(interaction: discord.Interaction):
     embed.add_field(name="⚙️ Info & Misc", value=(
         "`/tts_status` — Full settings & live state\n"
         "`/stats` — Session stats & cache\n"
+        "`/history` — Last 10 spoken messages\n"
         "`/ping` — Bot latency\n"
-        "`/autorejoinin on|off` — Auto-rejoin on disconnect\n"
-        "`/testtts [text]` — Test audio"
+        "`/settingsexport` / `/settingsimport` — Backup/restore\n"
+        "`/autorejoinin on|off` / `/testtts [text]`\n"
+        "`/ttshelp <command>` — Detailed help for any command"
     ), inline=False)
-    embed.set_footer(text="Settings persist across restarts. Type !fr/!es/!de etc. before a message for one-off language override.")
+    embed.set_footer(text="Settings persist across restarts. Type !fr/!es/!de etc. before a message for a one-off language override.")
     await interaction.response.send_message(embed=embed)
 
 
