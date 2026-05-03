@@ -18,6 +18,7 @@ import shutil
 import asyncio
 import tempfile
 import itertools
+import datetime
 import unicodedata
 from collections import OrderedDict
 from pathlib import Path
@@ -441,6 +442,21 @@ class GuildQueue:
             self._event.clear()
         return removed
 
+    def skip_many(self, n: int) -> int:
+        """Remove the next n items from the front. Returns count actually removed."""
+        n = min(n, len(self._items))
+        self._items = self._items[n:]
+        if not self._items:
+            self._event.clear()
+        return n
+
+    def position_of_user(self, user_id: int) -> int:
+        """Return 1-based position of the first item belonging to user_id, or -1 if none."""
+        for i, item in enumerate(self._items):
+            if item.user_id == user_id:
+                return i + 1
+        return -1
+
     def size(self) -> int:
         return len(self._items)
 
@@ -461,6 +477,7 @@ user_last_content:  dict[tuple, str]           = {}  # (guild_id, user_id) -> la
 guild_intentional_leave: set[int]             = set()  # guilds where /leave was used (no auto-rejoin)
 guild_auto_rejoin_channel: dict[int, int]     = {}  # guild_id -> channel_id to rejoin if unexpectedly disconnected
 guild_last_spoken: dict[int, str]             = {}  # guild_id -> last text spoken (for /repeat)
+user_message_times: dict[tuple, list[float]] = {}  # (guild_id, user_id) -> list of monotonic timestamps
 
 # ─── Session stats ────────────────────────────────────────────────────────────
 _bot_start_time                               = time.monotonic()
@@ -537,6 +554,18 @@ def default_settings() -> dict:
         "volume":               100,
         # Saved shortcut phrases {name: text}
         "phrases":              {},
+        # VC join/leave announcements
+        "vc_announce":          False,
+        # Custom pronunciation overrides {word: replacement}
+        "pronounce_dict":       {},
+        # Per-user rate limit
+        "user_rate_limit":      0,    # max messages per window (0 = disabled)
+        "user_rate_window":     10,   # window in seconds
+        # Log channel for spoken messages
+        "log_channel_id":       None,
+        # Silence/night mode (HH:MM strings or None)
+        "silence_start":        None,
+        "silence_end":          None,
     }
 
 
@@ -603,6 +632,31 @@ def clean_message(text: str) -> Optional[str]:
     text = expand_abbreviations(text)                   # lol → laughing out loud, etc.
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
+
+
+def apply_pronunciation(text: str, pronounce_dict: dict) -> str:
+    """Replace words using the guild's custom pronunciation dictionary (case-insensitive whole-word)."""
+    for word, replacement in pronounce_dict.items():
+        text = re.sub(rf"\b{re.escape(word)}\b", replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+def _is_silence_time(s: dict) -> bool:
+    """Return True if the current local time falls within the configured silence window."""
+    start_str = s.get("silence_start")
+    end_str   = s.get("silence_end")
+    if not start_str or not end_str:
+        return False
+    try:
+        now     = datetime.datetime.now().time()
+        t_start = datetime.time.fromisoformat(start_str)
+        t_end   = datetime.time.fromisoformat(end_str)
+        if t_start <= t_end:
+            return t_start <= now < t_end
+        else:  # wraps midnight  e.g. 23:00 → 07:00
+            return now >= t_start or now < t_end
+    except ValueError:
+        return False
 
 
 def _is_mostly_emoji(text: str) -> bool:
@@ -731,6 +785,11 @@ async def tts_worker(guild: discord.Guild):
             if not vc or not vc.is_connected():
                 continue
 
+            # Silence / night-mode check — skip item silently
+            if _is_silence_time(s):
+                print(f"[Worker] Silence mode active — skipping in {guild.name}")
+                continue
+
             # Clean and smart-truncate text
             cleaned = clean_message(item.text)
             if not cleaned:
@@ -808,6 +867,18 @@ async def tts_worker(guild: discord.Guild):
                     touch_activity(guild.id)
                     guild_last_spoken[guild.id] = cleaned
                     guild_messages_read[guild.id] = guild_messages_read.get(guild.id, 0) + 1
+
+                    # Post to log channel if configured
+                    log_ch_id = s.get("log_channel_id")
+                    if log_ch_id:
+                        log_ch = guild.get_channel(log_ch_id)
+                        if log_ch:
+                            ts = datetime.datetime.now().strftime("%H:%M:%S")
+                            try:
+                                await log_ch.send(f"`[{ts}]` 🔊 {cleaned}", silent=True)
+                            except Exception:
+                                pass
+
                     success = True
                     break
 
@@ -1071,22 +1142,43 @@ async def on_message(message: discord.Message):
                            else message.author.name)
             display = strip_name_tags(raw_display)
 
+            # Per-user rate limiter
+            rate_limit  = s.get("user_rate_limit", 0)
+            rate_window = s.get("user_rate_window", 10)
+            if rate_limit > 0:
+                key_rate = (message.guild.id, message.author.id)
+                now_m    = time.monotonic()
+                times    = user_message_times.get(key_rate, [])
+                times    = [t for t in times if now_m - t < rate_window]
+                if len(times) >= rate_limit:
+                    await bot.process_commands(message)
+                    return
+                times.append(now_m)
+                user_message_times[key_rate] = times
+
             # Per-user language override
             uid  = str(message.author.id)
             lang = s.get("user_languages", {}).get(uid) or s.get("language", "en")
 
+            # Inline language override: !fr <text> or !es <text> etc.
+            raw_content = message.content
+            inline_match = re.match(r"^!([a-z]{2}(?:-[a-zA-Z]{2,4})?)\s+(.+)", raw_content, re.DOTALL)
+            if inline_match:
+                lang        = inline_match.group(1).lower()
+                raw_content = inline_match.group(2)
+
             # Build text
             if s["say_name"]:
                 prefix    = s.get("voice_prefix", "says")
-                full_text = f"{display} {prefix} {message.content}"
+                full_text = f"{display} {prefix} {raw_content}"
             else:
-                full_text = message.content
+                full_text = raw_content
 
             # Auto-translate: translate the message content before speaking
             # Translation runs on the raw message, not on the "username says" prefix
-            if s.get("auto_translate", False):
+            if s.get("auto_translate", False) and not inline_match:
                 target = s.get("translate_target", "en")
-                raw_translated = await translate_text(message.content, target)
+                raw_translated = await translate_text(raw_content, target)
                 if s["say_name"]:
                     prefix    = s.get("voice_prefix", "says")
                     full_text = f"{display} {prefix} {raw_translated}"
@@ -1099,6 +1191,11 @@ async def on_message(message: discord.Message):
             blocklist = s.get("word_blocklist", [])
             if blocklist:
                 full_text = apply_blocklist(full_text, blocklist)
+
+            # Apply custom pronunciation overrides
+            pronounce_dict = s.get("pronounce_dict", {})
+            if pronounce_dict:
+                full_text = apply_pronunciation(full_text, pronounce_dict)
 
             # Host priority
             host_id   = s.get("host_id")
@@ -1186,6 +1283,25 @@ async def on_voice_state_update(
                     await safe_join(after.channel, guild)
             elif join_any:
                 await safe_join(after.channel, guild)
+
+    # ── VC join/leave announcements ───────────────────────────────────────────
+    if s.get("vc_announce", False) and vc and vc.is_connected():
+        bot_vc = vc.channel
+        name   = strip_name_tags(member.display_name)
+        announce_text: Optional[str] = None
+        if after.channel is not None and after.channel.id == bot_vc.id and (
+            before.channel is None or before.channel.id != after.channel.id
+        ):
+            announce_text = f"{name} has joined"
+        elif before.channel is not None and before.channel.id == bot_vc.id and (
+            after.channel is None or after.channel.id != before.channel.id
+        ):
+            announce_text = f"{name} has left"
+        if announce_text:
+            asyncio.create_task(enqueue(
+                guild, announce_text,
+                lang=s.get("language", "en"), slow=False, max_length=80, priority=1,
+            ))
 
     # ── FIX: Delayed auto-leave with settle period and re-check ──────────────
     # Schedule a check rather than disconnecting immediately.
@@ -1824,14 +1940,28 @@ async def cmd_status(interaction: discord.Interaction):
     speech_rate     = s.get("speech_rate", "+0%")
     auto_rejoin_on  = s.get("auto_rejoin", True)
 
-    volume_pct    = s.get("volume", 100)
-    phrase_count  = len(s.get("phrases", {}))
+    volume_pct      = s.get("volume", 100)
+    phrase_count    = len(s.get("phrases", {}))
+    pronounce_count = len(s.get("pronounce_dict", {}))
+    vc_announce_on  = s.get("vc_announce", False)
+    rate_limit      = s.get("user_rate_limit", 0)
+    rate_window     = s.get("user_rate_window", 10)
+    log_ch_id       = s.get("log_channel_id")
+    log_ch          = interaction.guild.get_channel(log_ch_id) if log_ch_id else None
+    sil_start       = s.get("silence_start") or "off"
+    sil_end         = s.get("silence_end")   or "off"
+    silence_val     = f"`{sil_start}` → `{sil_end}`" if sil_start != "off" else "off"
 
     embed.add_field(name="🆕 Extra Features", value=(
         f"**Speech rate:** `{speech_rate}`\n"
         f"**Volume:** `{volume_pct}%`\n"
         f"**Auto-rejoin:** {oo(auto_rejoin_on)}\n"
         f"**Saved phrases:** `{phrase_count}`\n"
+        f"**Pronounce overrides:** `{pronounce_count}`\n"
+        f"**VC announce:** {oo(vc_announce_on)}\n"
+        f"**Rate limit:** {'off' if rate_limit == 0 else f'{rate_limit} msgs / {rate_window}s'}\n"
+        f"**Log channel:** {log_ch.mention if log_ch else 'none'}\n"
+        f"**Silence window:** {silence_val}\n"
         f"**Blocklist:** {', '.join(f'`{w}`' for w in blocklist_words) or 'None'}"
     ), inline=False)
 
@@ -2169,6 +2299,187 @@ async def cmd_ping(interaction: discord.Interaction):
     )
 
 
+# ── VC announce ───────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="vcannounce", description="Announce when users join or leave the voice channel")
+@app_commands.describe(enabled="on to enable, off to disable")
+@app_commands.choices(enabled=[
+    app_commands.Choice(name="on",  value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def cmd_vcannounce(interaction: discord.Interaction, enabled: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["vc_announce"] = (enabled == "on"); save_settings()
+    state = "enabled" if s["vc_announce"] else "disabled"
+    await interaction.response.send_message(f"VC join/leave announcements **{state}**.", ephemeral=True)
+
+
+# ── Pronunciation ─────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="pronounce", description="Manage custom pronunciation overrides")
+@app_commands.describe(
+    action="add, remove, or list",
+    word="The word or acronym to override (e.g. BMW)",
+    replacement="What to say instead (e.g. Bee Em Double-you)",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="add",    value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+    app_commands.Choice(name="list",   value="list"),
+])
+async def cmd_pronounce(
+    interaction: discord.Interaction,
+    action: str,
+    word: Optional[str] = None,
+    replacement: Optional[str] = None,
+):
+    if not has_permission(interaction) and action != "list":
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    pd = s.setdefault("pronounce_dict", {})
+
+    if action == "list":
+        if not pd:
+            await interaction.response.send_message("No pronunciation overrides saved yet.", ephemeral=True); return
+        lines = "\n".join(f"`{w}` → *{r}*" for w, r in sorted(pd.items()))
+        embed  = discord.Embed(title="🗣️ Pronunciation Overrides", description=lines, color=discord.Color.blurple())
+        await interaction.response.send_message(embed=embed, ephemeral=True); return
+
+    if not word:
+        await interaction.response.send_message("Please provide a word.", ephemeral=True); return
+
+    key = word.strip()
+    if action == "add":
+        if not replacement:
+            await interaction.response.send_message("Please provide a replacement.", ephemeral=True); return
+        if len(pd) >= 50 and key not in pd:
+            await interaction.response.send_message("Limit reached (50 entries). Remove one first.", ephemeral=True); return
+        pd[key] = replacement.strip(); save_settings()
+        await interaction.response.send_message(f"Set: `{key}` → *{replacement.strip()}*", ephemeral=True)
+    elif action == "remove":
+        if key not in pd:
+            await interaction.response.send_message(f"`{key}` not found in pronunciation overrides.", ephemeral=True); return
+        del pd[key]; save_settings()
+        await interaction.response.send_message(f"Removed pronunciation override for `{key}`.", ephemeral=True)
+
+
+# ── Per-user rate limit ────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setuserrate", description="Limit how many messages per user get read (0 = unlimited)")
+@app_commands.describe(
+    messages="Max messages to read per window (0 = off)",
+    seconds="Rolling window in seconds (default 10)",
+)
+async def cmd_setuserrate(interaction: discord.Interaction, messages: int, seconds: int = 10):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    if messages < 0 or seconds < 1:
+        await interaction.response.send_message("Messages must be ≥ 0 and seconds ≥ 1.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["user_rate_limit"]  = messages
+    s["user_rate_window"] = seconds
+    save_settings()
+    if messages == 0:
+        await interaction.response.send_message("Per-user rate limit **disabled**.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"Rate limit set: max **{messages}** message(s) per **{seconds}s** per user.", ephemeral=True
+        )
+
+
+# ── Log channel ────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="setlogchannel", description="Set a text channel to log every spoken message")
+async def cmd_setlogchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["log_channel_id"] = channel.id; save_settings()
+    await interaction.response.send_message(
+        f"Spoken messages will be logged to {channel.mention}.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="clearlogchannel", description="Stop logging spoken messages to a channel")
+async def cmd_clearlogchannel(interaction: discord.Interaction):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["log_channel_id"] = None; save_settings()
+    await interaction.response.send_message("Log channel cleared.", ephemeral=True)
+
+
+# ── Silence / night mode ───────────────────────────────────────────────────────
+
+@bot.tree.command(name="silence", description="Mute TTS between two times (24h HH:MM, e.g. 23:00 07:00)")
+@app_commands.describe(start="Start of silence window e.g. 23:00", end="End of silence window e.g. 07:00")
+async def cmd_silence(interaction: discord.Interaction, start: str, end: str):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    # Validate format
+    try:
+        datetime.time.fromisoformat(start)
+        datetime.time.fromisoformat(end)
+    except ValueError:
+        await interaction.response.send_message("Invalid time format — use HH:MM e.g. `23:00`.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["silence_start"] = start
+    s["silence_end"]   = end
+    save_settings()
+    await interaction.response.send_message(
+        f"🌙 Silence mode set: **{start}** → **{end}**. TTS will be muted during this window.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="clearsilence", description="Disable silence/night mode")
+async def cmd_clearsilence(interaction: discord.Interaction):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    s = get_guild_settings(interaction.guild.id)
+    s["silence_start"] = None
+    s["silence_end"]   = None
+    save_settings()
+    await interaction.response.send_message("Silence mode disabled — TTS active 24/7.", ephemeral=True)
+
+
+# ── Skip next N ───────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="skipnext", description="Skip the next N queued messages at once")
+@app_commands.describe(count="How many messages to skip (1–20)")
+async def cmd_skipnext(interaction: discord.Interaction, count: int):
+    if not has_permission(interaction):
+        await interaction.response.send_message("No permission.", ephemeral=True); return
+    if not 1 <= count <= 20:
+        await interaction.response.send_message("Count must be between 1 and 20.", ephemeral=True); return
+    removed = get_queue(interaction.guild.id).skip_many(count)
+    if removed == 0:
+        await interaction.response.send_message("Queue is already empty.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Skipped **{removed}** queued message(s).", ephemeral=True)
+
+
+# ── Queue position ─────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="queuepos", description="See your position in the TTS queue")
+async def cmd_queuepos(interaction: discord.Interaction):
+    q   = get_queue(interaction.guild.id)
+    pos = q.position_of_user(interaction.user.id)
+    sz  = q.size()
+    if pos == -1:
+        if sz == 0:
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                f"You have no messages in the queue ({sz} total queued).", ephemeral=True
+            )
+    else:
+        await interaction.response.send_message(
+            f"Your next message is at position **{pos}** of {sz} in the queue.", ephemeral=True
+        )
+
+
 @bot.tree.command(name="panel", description="Show all TTS bot commands")
 async def cmd_panel(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -2186,14 +2497,14 @@ async def cmd_panel(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name="🔊 Voice & Queue", value=(
         "`/join` / `/leave`\n"
-        "`/say <text>` — Read at top priority instantly\n"
-        "`/announce <text>` — Clear queue + urgent announcement\n"
-        "`/countdown <n>` — Count down 3… 2… 1… Go!\n"
-        "`/repeat` — Re-read the last spoken message\n"
-        "`/schedule <s> <text>` — Read after a delay\n"
-        "`/skip` / `/pause` / `/resume`\n"
-        "`/queue` / `/queueview` / `/clearqueue`\n"
-        "`/removefromqueue <n>` / `/clearuserqueue @user`"
+        "`/say <text>` — Top-priority instant read\n"
+        "`/announce <text>` — Clear queue + announcement\n"
+        "`/countdown <n>` — 3… 2… 1… Go!\n"
+        "`/repeat` — Re-read last spoken message\n"
+        "`/schedule <s> <text>` — Delayed read\n"
+        "`/skip` / `/skipnext <n>` / `/pause` / `/resume`\n"
+        "`/queue` / `/queueview` / `/queuepos`\n"
+        "`/clearqueue` / `/removefromqueue <n>` / `/clearuserqueue @user`"
     ), inline=False)
     embed.add_field(name="📋 Saved Phrases", value=(
         "`/phraseadd <name> <text>` — Save a phrase\n"
@@ -2201,30 +2512,39 @@ async def cmd_panel(interaction: discord.Interaction):
         "`/phraselist` — See all saved phrases\n"
         "`/phraseremove <name>` — Delete a phrase"
     ), inline=False)
-    embed.add_field(name="🗣️ TTS", value=(
+    embed.add_field(name="🗣️ TTS & Language", value=(
         "`/tts_on` / `/tts_off`\n"
         "`/setlang` — Server language (dropdown)\n"
         "`/setmylang` / `/clearmylang` — Personal language\n"
         "`/setmaxlength <n>` / `/setcooldown <s>`\n"
-        "`/speed_slow` / `/speed_normal`"
+        "`/speed_slow` / `/speed_normal`\n"
+        "**Inline:** type `!fr Bonjour` to speak in French"
     ), inline=False)
     embed.add_field(name="🎙️ Voice Engine", value=(
         "`/ttsengine` — Switch engine (dropdown)\n"
         "`/setvoice` — Neural voice (dropdown)\n"
         "`/setspeed` — Speech rate (dropdown)\n"
         "`/volume <1–200>` — Output volume\n"
-        "`/voicelist` — See all voices"
+        "`/voicelist` — See all voices\n"
+        "`/pronounce add/remove/list` — Custom pronunciation"
     ), inline=False)
     embed.add_field(name="🌐 Translation", value=(
         "`/translate on|off` — Auto-translate messages\n"
         "`/settranslatetarget` — Target language (dropdown)"
     ), inline=False)
-    embed.add_field(name="🔒 Filters & Blocklist", value=(
-        "`/addblock <word>` / `/removeblock <word>`\n"
-        "`/blocklist` — View blocked words\n"
+    embed.add_field(name="🔒 Filters & Limits", value=(
+        "`/addblock <word>` / `/removeblock <word>` / `/blocklist`\n"
+        "`/setuserrate <msgs> <secs>` — Per-user rate limit\n"
         "`/samevc_on` / `/samevc_off`\n"
         "`/smartfilter_on` / `/smartfilter_off`\n"
         "`/ignore @user` / `/unignore @user`"
+    ), inline=False)
+    embed.add_field(name="📢 Announcements & Logging", value=(
+        "`/vcannounce on|off` — Announce joins/leaves\n"
+        "`/setlogchannel #ch` — Log spoken messages\n"
+        "`/clearlogchannel` — Stop logging\n"
+        "`/silence HH:MM HH:MM` — Night/silence mode\n"
+        "`/clearsilence` — Disable silence mode"
     ), inline=False)
     embed.add_field(name="👤 Name & Host", value=(
         "`/sayname_on` / `/sayname_off`\n"
@@ -2235,12 +2555,12 @@ async def cmd_panel(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name="⚙️ Info & Misc", value=(
         "`/tts_status` — Full settings & live state\n"
-        "`/stats` — Session stats & cache info\n"
+        "`/stats` — Session stats & cache\n"
         "`/ping` — Bot latency\n"
         "`/autorejoinin on|off` — Auto-rejoin on disconnect\n"
         "`/testtts [text]` — Test audio"
     ), inline=False)
-    embed.set_footer(text="Settings persist across restarts. Nickname tags like [ADMIN] are stripped automatically.")
+    embed.set_footer(text="Settings persist across restarts. Type !fr/!es/!de etc. before a message for one-off language override.")
     await interaction.response.send_message(embed=embed)
 
 
