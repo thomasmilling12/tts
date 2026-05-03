@@ -836,12 +836,16 @@ async def tts_worker(guild: discord.Guild):
                         cached = cache_get(cleaned, f"{item.lang}_{cache_key_extra}", item.slow)
                         if cached:
                             mp3.write_bytes(cached)
+                            print(f"[TTS] Cache hit, {len(cached)} bytes")
                         elif engine == "edge":
                             # Edge TTS — natural neural voices, async native
                             try:
                                 speech_rate = s.get("speech_rate", "+0%")
+                                print(f"[TTS] Edge TTS: voice={edge_voice} rate={speech_rate} text={cleaned[:40]!r}")
                                 communicate = edge_tts.Communicate(cleaned, edge_voice, rate=speech_rate)
                                 await communicate.save(str(mp3))
+                                mp3_size = mp3.stat().st_size
+                                print(f"[TTS] Edge TTS saved: {mp3_size} bytes")
                                 cache_put(cleaned, f"{item.lang}_{cache_key_extra}", item.slow, mp3.read_bytes())
                             except Exception as edge_err:
                                 # Fall back to gTTS if edge-tts fails for any reason
@@ -849,19 +853,26 @@ async def tts_worker(guild: discord.Guild):
                                 def _gtts_fallback():
                                     gTTS(text=cleaned, lang=item.lang, slow=item.slow).save(str(mp3))
                                 await loop.run_in_executor(None, _gtts_fallback)
+                                print(f"[TTS] gTTS fallback saved: {mp3.stat().st_size} bytes")
                                 cache_put(cleaned, f"{item.lang}_{cache_key_extra}", item.slow, mp3.read_bytes())
                         else:
                             # gTTS — runs in executor so event loop stays free
+                            print(f"[TTS] gTTS: lang={item.lang} text={cleaned[:40]!r}")
                             def _generate():
                                 gTTS(text=cleaned, lang=item.lang, slow=item.slow).save(str(mp3))
                             await loop.run_in_executor(None, _generate)
+                            print(f"[TTS] gTTS saved: {mp3.stat().st_size} bytes")
                             cache_put(cleaned, f"{item.lang}_{cache_key_extra}", item.slow, mp3.read_bytes())
+
+                        if not mp3.exists() or mp3.stat().st_size == 0:
+                            print(f"[Playback] SKIPPING — mp3 is empty or missing!")
+                            continue
 
                         done = asyncio.Event()
 
                         def _after(err):
                             if err:
-                                print(f"[Playback] Error after play: {err}")
+                                print(f"[Playback] Error after play: {err}", flush=True)
                             loop.call_soon_threadsafe(done.set)
 
                         vol    = s.get("volume", 100) / 100.0
@@ -870,12 +881,13 @@ async def tts_worker(guild: discord.Guild):
 
                         try:
                             vc.play(source, after=_after)
+                            print(f"[Playback] vc.play() called OK, vol={vol:.2f}", flush=True)
                         except Exception as play_err:
-                            print(f"[Playback] vc.play() raised: {play_err}")
+                            print(f"[Playback] vc.play() raised: {play_err}", flush=True)
                             done.set()  # prevent infinite hang
 
                         touch_activity(guild.id)
-                        print(f"[Playback] Playing in {guild.name}")
+                        print(f"[Playback] Playing in {guild.name}", flush=True)
 
                         # Wait with 5-min safety timeout so worker never hangs permanently
                         try:
