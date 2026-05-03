@@ -772,6 +772,7 @@ async def tts_worker(guild: discord.Guild):
 
         try:
             vc = guild.voice_client
+            print(f"[DEBUG] Worker got item in {guild.name}: vc={vc} connected={vc.is_connected() if vc else 'N/A'} text={item.text[:40]!r}")
             if not vc or not vc.is_connected():
                 print(f"[Worker] Skipping item — bot not connected in {guild.name}")
                 continue
@@ -1152,6 +1153,16 @@ async def on_message(message: discord.Message):
         return
 
     s = get_guild_settings(message.guild.id)
+
+    # ── DEBUG: trace every non-bot guild message ──────────────────────────────
+    if not message.author.bot:
+        vc = message.guild.voice_client
+        print(
+            f"[DEBUG] msg from {message.author} in #{message.channel.name} | "
+            f"tts_enabled={s['tts_enabled']} nomic_ch={s['no_mic_channel_id']} "
+            f"this_ch={message.channel.id} vc_connected={vc.is_connected() if vc else 'NO VC'}"
+        )
+    # ─────────────────────────────────────────────────────────────────────────
 
     if not should_skip(message, s):
         if await in_same_vc(message, s):
