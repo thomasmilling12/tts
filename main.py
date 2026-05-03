@@ -863,16 +863,24 @@ async def tts_worker(guild: discord.Guild):
                                 print(f"[Playback] Error after play: {err}")
                             loop.call_soon_threadsafe(done.set)
 
-                        vol   = s.get("volume", 100) / 100.0
-                        raw   = discord.FFmpegPCMAudio(str(mp3))
+                        vol    = s.get("volume", 100) / 100.0
+                        raw    = discord.FFmpegPCMAudio(str(mp3))
                         source = discord.PCMVolumeTransformer(raw, volume=vol)
-                        vc.play(source, after=_after)
+
+                        try:
+                            vc.play(source, after=_after)
+                        except Exception as play_err:
+                            print(f"[Playback] vc.play() raised: {play_err}")
+                            done.set()  # prevent infinite hang
 
                         touch_activity(guild.id)
                         print(f"[Playback] Playing in {guild.name}")
 
-                        # Wait inside temp dir so mp3 file stays alive
-                        await done.wait()
+                        # Wait with 5-min safety timeout so worker never hangs permanently
+                        try:
+                            await asyncio.wait_for(done.wait(), timeout=300)
+                        except asyncio.TimeoutError:
+                            print(f"[Playback] Timed out waiting for audio in {guild.name}")
 
                     print(f"[Playback] Finished in {guild.name}")
                     touch_activity(guild.id)
